@@ -4,8 +4,8 @@
 # =============================================================================
 
 # ── 飞书开放平台凭证 ──────────────────────────────────────────────────────────
-FEISHU_APP_ID     = ""          # 飞书应用的 App ID，形如 cli_xxxxxxxxxxxxxxxx
-FEISHU_APP_SECRET = ""          # 飞书应用的 App Secret
+FEISHU_APP_ID     = "cli_a944809b53ba1cb1"          # 飞书应用的 App ID，形如 cli_xxxxxxxxxxxxxxxx
+FEISHU_APP_SECRET = "VAURQj1G30i1EJVsVryukcR7aoZxkEhS"          # 飞书应用的 App Secret
 
 # ── 飞书多维表格 Base ID（每张表一个独立 Base）────────────────────────────────
 FEISHU_BASE_ID_HOUSE     = ""   # 01_房源总库    的 Base ID，形如 RHrXbxxxxxxx
