@@ -1,0 +1,17 @@
+# =============================================================================
+# requirements.txt — 依赖清单（锁定版本，确保环境一致）
+# 安装命令：pip install -r requirements.txt
+# =============================================================================
+
+# HTTP 请求库
+requests==2.32.3
+
+# HTML 解析
+beautifulsoup4==4.12.3
+lxml==5.3.0          # BeautifulSoup 的高性能解析器后端
+
+# Anthropic / Claude API SDK
+anthropic==0.40.0
+
+# 类型提示支持（Python 3.10 已内置，此包仅用于 IDE 提示增强）
+# typing-extensions==4.12.2
