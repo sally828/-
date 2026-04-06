@@ -1,6 +1,6 @@
 # =============================================================================
-# scraper_ke.py — 贝壳找房上海二手房采集器
-# 采集 https://sh.ke.com/ershoufang/ 按区域 + 价格区间筛选
+# scraper_ke.py — 链家上海二手房采集器
+# 采集 https://sh.lianjia.com/ershoufang/ 按区域 + 价格区间筛选
 # 遵守 robots.txt，加随机延迟，自动写入飞书 01_房源总库
 # =============================================================================
 
@@ -8,7 +8,6 @@ import re
 import time
 import random
 import logging
-import urllib.robotparser
 from datetime import datetime
 from typing import Optional
 
@@ -20,7 +19,7 @@ import feishu_sdk
 
 logger = logging.getLogger(__name__)
 
-# 贝壳各行政区对应的 URL 路径关键字
+# 链家各行政区对应的 URL 路径关键字
 # 格式：显示名 → URL 路径段
 DISTRICT_URL_MAP = {
     "浦东": "pudong",
@@ -37,35 +36,15 @@ DISTRICT_URL_MAP = {
     "松江": "songjiang",
 }
 
-# 价格区间对应的贝壳 URL 参数
-# 贝壳价格筛选格式：bp300ep500（300万-500万）
+# 价格区间对应的链家 URL 参数
+# 链家价格筛选格式：bp300ep500（300万-500万）
 PRICE_RANGE_MAP = {
     "300-500万": "bp300ep500",
     "500-800万": "bp500ep800",
 }
 
-
-# ─────────────────────────────────────────────
-# robots.txt 检查
-# ─────────────────────────────────────────────
-
-def _check_robots_allowed(url: str) -> bool:
-    """
-    检查目标 URL 是否允许爬取（遵守 robots.txt）。
-    若无法获取 robots.txt，默认允许（宽松策略）。
-    """
-    try:
-        rp = urllib.robotparser.RobotFileParser()
-        robots_url = "https://sh.ke.com/robots.txt"
-        rp.set_url(robots_url)
-        rp.read()
-        allowed = rp.can_fetch("*", url)
-        if not allowed:
-            logger.warning("robots.txt 禁止访问：%s", url)
-        return allowed
-    except Exception as exc:
-        logger.warning("无法读取 robots.txt（%s），跳过检查", exc)
-        return True
+# 链家基础 URL
+_BASE_URL = "https://sh.lianjia.com/ershoufang"
 
 
 # ─────────────────────────────────────────────
@@ -80,14 +59,21 @@ def _get_page(url: str, session: requests.Session) -> Optional[BeautifulSoup]:
     ua = random.choice(config.KE_USER_AGENTS)
     headers = {
         "User-Agent": ua,
-        "Accept-Language": "zh-CN,zh;q=0.9",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Referer": "https://sh.ke.com/",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Referer": "https://sh.lianjia.com/",
+        "Upgrade-Insecure-Requests": "1",
     }
     try:
         resp = session.get(url, headers=headers, timeout=20)
         resp.raise_for_status()
         resp.encoding = "utf-8"
+        # 检测是否被重定向到登录页
+        if "<title>登录</title>" in resp.text or "loginHolder" in resp.text:
+            logger.warning("被重定向到登录页，可能触发了反爬：%s", url)
+            return None
         return BeautifulSoup(resp.text, "html.parser")
     except requests.RequestException as exc:
         logger.error("请求失败 %s：%s", url, exc)
@@ -113,25 +99,29 @@ def _safe_float(text: str, default: float = 0.0) -> float:
 def _parse_listing(item, district: str, price_range: str) -> Optional[dict]:
     """
     解析单条房源 HTML 元素，返回字段字典。
+    链家房源列表 li.clear 结构。
     若关键字段缺失则返回 None。
     """
     try:
-        # ── 小区名 ──
-        community_tag = item.select_one(".positionInfo a.ml")
-        community = community_tag.get_text(strip=True) if community_tag else ""
-
-        # ── 板块/区域 ──
-        position_tag = item.select_one(".positionInfo")
-        position_text = position_tag.get_text(" ", strip=True) if position_tag else ""
-        # 格式类似 "陆家嘴 / 浦东" 或 "浦东新区陆家嘴"
-        block = position_text.split("/")[0].strip() if "/" in position_text else district
-
-        # ── 标题（含房型信息）──
-        title_tag = item.select_one(".title a")
+        # ── 标题 + 链接 ──
+        title_tag = item.select_one(".title a") or item.select_one("a.title")
         title = title_tag.get_text(strip=True) if title_tag else ""
         link = title_tag["href"] if title_tag and title_tag.has_attr("href") else ""
         if link and not link.startswith("http"):
-            link = "https://sh.ke.com" + link
+            link = "https://sh.lianjia.com" + link
+
+        # ── 小区名 ──
+        # 链家 .positionInfo 格式：小区名 - 板块/区域
+        position_tag = item.select_one(".positionInfo")
+        position_text = position_tag.get_text(" ", strip=True) if position_tag else ""
+        community_tag = item.select_one(".positionInfo a") or item.select_one(".positionInfo a.ml")
+        community = community_tag.get_text(strip=True) if community_tag else ""
+        if not community and position_text:
+            community = position_text.split("-")[0].strip()
+
+        # ── 板块 ──
+        block_tags = item.select(".positionInfo a")
+        block = block_tags[1].get_text(strip=True) if len(block_tags) > 1 else district
 
         # ── 房屋基本信息（面积、楼层、年份、房型）──
         house_info_tag = item.select_one(".houseInfo")
@@ -145,16 +135,16 @@ def _parse_listing(item, district: str, price_range: str) -> Optional[dict]:
         room_match = re.search(r"(\d+室\d+厅)", house_info)
         room_type = room_match.group(1) if room_match else ""
 
-        # 楼层：匹配 "中楼层/共26层" 格式
+        # 楼层：匹配 "低/中/高楼层" 格式
         floor_match = re.search(r"(低|中|高)楼层", house_info)
         floor_info = floor_match.group(0) if floor_match else ""
 
-        # 建造年份：匹配 "2005年建" 格式
-        year_match = re.search(r"(\d{4})年建", house_info)
+        # 建造年份：匹配 "2005年建" 或 "2005年" 格式
+        year_match = re.search(r"(\d{4})年", house_info)
         built_year = int(year_match.group(1)) if year_match else 0
 
         # ── 总价 ──
-        total_price_tag = item.select_one(".totalPrice span")
+        total_price_tag = item.select_one(".totalPrice span") or item.select_one(".totalPrice")
         total_price_text = total_price_tag.get_text(strip=True) if total_price_tag else "0"
         total_price = _safe_float(total_price_text)  # 单位：万元
 
@@ -164,23 +154,20 @@ def _parse_listing(item, district: str, price_range: str) -> Optional[dict]:
             return None
 
         # ── 单价 ──
-        unit_price_tag = item.select_one(".unitPrice span")
+        unit_price_tag = item.select_one(".unitPrice span") or item.select_one(".unitPrice")
         unit_price_text = unit_price_tag.get_text(strip=True) if unit_price_tag else "0"
         unit_price = _safe_int(unit_price_text)  # 单位：元/㎡
 
-        # ── 挂牌时长 ──
-        # 贝壳有时在 .followInfo 里显示 "23天以前发布"
+        # ── 挂牌时长 + 关注人数 ──
         follow_tag = item.select_one(".followInfo")
         follow_text = follow_tag.get_text(" ", strip=True) if follow_tag else ""
         days_match = re.search(r"(\d+)\s*天以前", follow_text)
         listing_days = int(days_match.group(1)) if days_match else 0
-
-        # ── 关注人数 ──
         attention_match = re.search(r"(\d+)\s*人关注", follow_text)
         attention_count = int(attention_match.group(1)) if attention_match else 0
 
         # ── 是否降价 ──
-        tag_tags = item.select(".tag span, .tagList span")
+        tag_tags = item.select(".tag span, .tagList span, .houseTag span")
         tag_texts = [t.get_text(strip=True) for t in tag_tags]
         is_price_drop = any("降价" in t or "价格下调" in t for t in tag_texts)
 
@@ -234,14 +221,12 @@ def scrape_district_price(
     all_listings: list[dict] = []
 
     for page in range(1, config.KE_MAX_PAGES + 1):
-        # 贝壳分页格式：pg2 表示第2页
+        # 链家分页格式：pg2 表示第2页
         page_seg = f"pg{page}" if page > 1 else ""
-        url = f"{config.KE_BASE_URL}{district_path}/{price_param}/{page_seg}".rstrip("/") + "/"
-
-        # robots.txt 检查（仅第一页检查一次）
-        if page == 1 and not _check_robots_allowed(url):
-            logger.warning("robots.txt 不允许采集 %s，跳过", url)
-            break
+        if page_seg:
+            url = f"{_BASE_URL}/{district_path}/{price_param}/{page_seg}/"
+        else:
+            url = f"{_BASE_URL}/{district_path}/{price_param}/"
 
         print(f"  正在采集第 {page} 页：{url}")
         soup = _get_page(url, session)
@@ -250,11 +235,12 @@ def scrape_district_price(
             print(f"  ✗ 第 {page} 页请求失败，跳过")
             break
 
-        # 贝壳房源列表容器
+        # 链家房源列表容器
         items = soup.select("ul.sellListContent li.clear")
         if not items:
-            # 也尝试另一种选择器（贝壳页面结构可能有变化）
-            items = soup.select(".listContent li")
+            items = soup.select(".sellListContent li")
+        if not items:
+            items = soup.select("ul.listContent li")
 
         if not items:
             print(f"  → 第 {page} 页无数据，采集结束")
