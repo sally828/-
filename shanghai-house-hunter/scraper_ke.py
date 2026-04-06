@@ -63,8 +63,9 @@ def _get_page(url: str, session: requests.Session) -> Optional[BeautifulSoup]:
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Encoding": "gzip, deflate, br",
         "Connection": "keep-alive",
-        "Referer": "https://sh.lianjia.com/",
+        "Referer": "https://sh.lianjia.com/ershoufang/",
         "Upgrade-Insecure-Requests": "1",
+        "Cookie": getattr(config, "LIANJIA_COOKIES", ""),
     }
     try:
         resp = session.get(url, headers=headers, timeout=20)

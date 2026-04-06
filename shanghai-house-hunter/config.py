@@ -31,9 +31,13 @@ BUDGET_HIGH = (500, 800)        # 500-800 万元
 # ── 目标行政区 ────────────────────────────────────────────────────────────────
 TARGET_DISTRICTS = ["浦东", "徐汇", "普陀", "长宁", "闵行", "杨浦", "虹口"]
 
-# ── 贝壳找房采集参数 ──────────────────────────────────────────────────────────
-KE_BASE_URL  = "https://sh.ke.com/ershoufang/"
+# ── 链家采集参数 ─────────────────────────────────────────────────────────────
+KE_BASE_URL  = "https://sh.lianjia.com/ershoufang/"
 KE_MAX_PAGES = 10               # 每个区域最多采集页数（每页约30条）
+
+# 浏览器 Cookie（从 Chrome/Edge 开发者工具 Network 标签复制）
+# 用于绕过链家反爬验证，有效期约数小时，过期后重新复制
+LIANJIA_COOKIES = "lianjia_uuid=4488f12d-275e-4479-ac8f-114ca59d34d4; select_city=310000; Hm_lvt_46bf127ac9b856df503ec2dbf942b67e=1775477289; HMACCOUNT=7346C3087B73B4C8; _jzqa=1.2941436352335173000.1775477289.1775477289.1775477289.1; _jzqc=1; _jzqx=1.1775477289.1775477289.1.jzqsr=so%2Ecom|jzqct=/link.-; _jzqckmp=1; sajssdk_2015_cross_new_user=1; sensorsdata2015jssdkcross=%7B%22distinct_id%22%3A%2219d62b171b6131-07a40c717c0f4c-f4f7526-1622400-19d62b171b714d0%22%2C%22%24device_id%22%3A%2219d62b171b6131-07a40c717c0f4c-f4f7526-1622400-19d62b171b714d0%22%2C%22props%22%3A%7B%22%24latest_traffic_source_type%22%3A%22%E8%87%AA%E7%84%B6%E6%90%9C%E7%B4%A2%E6%B5%81%E9%87%8F%22%2C%22%24latest_referrer%22%3A%22https%3A%2F%2Fwww.so.com%2Flink%3Fm%3DwIQgPI5HN%252F2RhETU9UdCPJp6sbUuJn1uAsUT6EOMFxOiGg1dlFYXMzZjztWYE2mU%252FpY8cLZ6xbe6M4NsY0GCysaxzKxv3otmcU%252B1%252FieaKeeWAokJcsRwK8KVba8M%253D%22%2C%22%24latest_referrer_host%22%3A%22www.so.com%22%2C%22%24latest_search_keyword%22%3A%22%E6%9C%AA%E5%8F%96%E5%88%B0%E5%80%BC%22%7D%7D; lianjia_ssid=65656627-028e-4673-b2ea-de427655eb70; _jzqb=1.2.10.1775477289.1; Hm_lpvt_46bf127ac9b856df503ec2dbf942b67e=1775477581"
 KE_DELAY_MIN = 2                # 请求间最短延迟（秒）
 KE_DELAY_MAX = 5                # 请求间最长延迟（秒）
 
