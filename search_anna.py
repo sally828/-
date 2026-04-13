@@ -256,7 +256,11 @@ async def main():
     books    = load_input()
     progress = load_progress()
 
-    need_search = [b for b in books if b.get("状态", "").strip() == "-- 未找到"]
+    def already_found(status: str) -> bool:
+        s = status.strip()
+        return "OK" in s or (s.startswith("✅") and "找到" in s)
+
+    need_search = [b for b in books if not already_found(b.get("状态", ""))]
     pending     = [b for b in need_search if b.get("序号", "") not in progress]
 
     print(f"📚 总计 {len(books)} 条 | 待搜索 {len(need_search)} 条 | 本次处理 {len(pending)} 条")

@@ -89,6 +89,11 @@ def main():
     if skipped:
         print(f"   跳过无法解析的行：{skipped} 行")
 
+    # 打印前3行供检查
+    print("\n【前3行内容预览，供检查格式是否正确】")
+    for b in books[:3]:
+        print(f"  序号={b['序号']} | 状态='{b['状态']}' | 书名={b['原书名'][:30]}")
+
 
 if __name__ == "__main__":
     main()
