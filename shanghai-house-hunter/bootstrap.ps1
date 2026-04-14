@@ -336,7 +336,7 @@ if __name__ == "__main__":
 
 # ── 将 auto_download.py 复制到桌面的"搜索"文件夹 ──────────────────────────
 $desktop   = [Environment]::GetFolderPath("Desktop")
-$searchDir = Join-Path $desktop "搜索"
+$searchDir = Join-Path $desktop "书目搜索"
 New-Item -ItemType Directory -Force -Path $searchDir | Out-Null
 Write-Host "`n复制 auto_download.py 到 $searchDir ..." -ForegroundColor Cyan
 Copy-Item -Path "$dir\auto_download.py" -Destination "$searchDir\auto_download.py" -Force
