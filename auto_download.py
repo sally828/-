@@ -58,31 +58,41 @@ def load_books() -> list[dict]:
             rows.append({"序号": num, "书名": name or f"书_{num}", "url": url})
     return rows
 
-def download_one(md5: str, title: str, session: requests.Session) -> Path | None:
-    for index in range(3):
-        dl_url = f"{BASE_URL}/fast_download/{md5}/{index}?key={API_KEY}"
-        try:
-            resp = session.get(dl_url, timeout=60, stream=True, allow_redirects=True)
-            ct = resp.headers.get("content-type", "")
-            if resp.status_code == 200 and "html" not in ct and len(resp.content) > 5000:
-                cd = resp.headers.get("content-disposition", "")
-                m = re.search(r'filename[^;=\n]*=[\'""]?([^\'";\n]+)', cd)
-                fname = m.group(1).strip() if m else ""
-                ext = fname.rsplit(".", 1)[-1] if "." in fname else "pdf"
-                save_path = DOWNLOAD_DIR / f"{safe_name(title)}.{ext}"
-                save_path.write_bytes(resp.content)
-                size_mb = save_path.stat().st_size / 1024 / 1024
-                if size_mb < 0.05:
-                    save_path.unlink(missing_ok=True)
-                    continue
-                print(f"    ✅ {save_path.name}  ({size_mb:.1f} MB)")
-                return save_path
-            elif resp.status_code in (403, 401):
-                print(f"    ❌ API key 无效或已过期 (HTTP {resp.status_code})")
-                return None
-        except Exception as e:
-            print(f"    ⚠ 镜像{index} 失败：{e}")
-    return None
+def download_one(excel_url: str, title: str, session: requests.Session) -> Path | None:
+    # 直接用 Excel 里的 URL，加上 API key
+    dl_url = excel_url + ("&" if "?" in excel_url else "?") + f"key={API_KEY}"
+    try:
+        # 第一步：访问 fast_download 页面，跟随跳转拿到 CDN 真实地址
+        resp = session.get(dl_url, timeout=30, allow_redirects=True)
+        final_url = resp.url   # 跳转后的 CDN 地址
+
+        ct = resp.headers.get("content-type", "")
+        if "html" in ct:
+            # 返回了页面而非文件，说明 key 无效或需要登录
+            print(f"    ❌ 返回 HTML，key 可能无效")
+            return None
+
+        # 第二步：保存文件内容
+        cd = resp.headers.get("content-disposition", "")
+        m = re.search(r'filename[^;=\n]*=[\'""]?([^\'";\n]+)', cd)
+        fname = m.group(1).strip() if m else ""
+        ext = (fname.rsplit(".", 1)[-1] if "." in fname
+               else final_url.split("?")[0].rsplit(".", 1)[-1][:5] or "pdf")
+
+        save_path = DOWNLOAD_DIR / f"{safe_name(title)}.{ext}"
+        with open(save_path, "wb") as f:
+            f.write(resp.content)
+
+        size_mb = save_path.stat().st_size / 1024 / 1024
+        if size_mb < 0.05:
+            save_path.unlink(missing_ok=True)
+            print(f"    ❌ 文件太小，可能下载失败")
+            return None
+        print(f"    ✅ {save_path.name}  ({size_mb:.1f} MB)")
+        return save_path
+    except Exception as e:
+        print(f"    ❌ 出错：{e}")
+        return None
 
 def main():
     if API_KEY == "你的密钥粘贴在这里":
@@ -111,8 +121,7 @@ def main():
     for i, book in enumerate(pending):
         num, title = book["序号"], book["书名"]
         print(f"[{i+1:4d}/{len(pending)}] #{num}  {title[:50]}")
-        md5 = extract_md5(book["url"])
-        if download_one(md5, title, session):
+        if download_one(book["url"], title, session):
             success += 1
             mark_done(num)
         else:
