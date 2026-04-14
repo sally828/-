@@ -83,58 +83,48 @@ def load_books() -> list[dict]:
 
 # ── API 下载 ──────────────────────────────────────────
 
-def get_download_url(md5: str, session: requests.Session) -> str | None:
-    """调用 fast_download JSON 接口，拿到直接下载链接"""
-    for index in range(3):   # 最多试 3 个镜像
+def try_download(md5: str, title: str, session: requests.Session) -> Path | None:
+    """
+    依次尝试 fast_download 的 0、1、2 号镜像，
+    直接跟随跳转下载文件，成功则保存并返回路径。
+    """
+    for index in range(3):
+        url = f"{BASE_URL}/fast_download/{md5}/{index}?key={API_KEY}"
         try:
-            resp = session.get(
-                f"{BASE_URL}/fast_download/{md5}/{index}",
-                params={"key": API_KEY},
-                timeout=20,
-                allow_redirects=False,
-            )
-            # 302 跳转 → 直链
-            if resp.status_code in (301, 302, 303):
-                return resp.headers.get("Location")
-            # JSON 响应
-            if resp.status_code == 200 and "application/json" in resp.headers.get("content-type", ""):
-                data = resp.json()
-                url = data.get("download_url") or data.get("url")
-                if url:
-                    return url
-        except Exception:
+            resp = session.get(url, timeout=120, stream=True, allow_redirects=True)
+            ct = resp.headers.get("content-type", "")
+
+            # 是文件流（非 HTML）→ 直接保存
+            if resp.status_code == 200 and "html" not in ct:
+                cd = resp.headers.get("content-disposition", "")
+                m = re.search(r'filename[^;=\n]*=[\'""]?([^\'"\n;]+)', cd)
+                fname = m.group(1).strip() if m else ""
+                ext = (fname.rsplit(".", 1)[-1]
+                       if "." in fname
+                       else url.split("?")[0].rsplit(".", 1)[-1][:5] or "pdf")
+
+                save_path = DOWNLOAD_DIR / f"{safe_name(title)}.{ext}"
+                with open(save_path, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=65536):
+                        f.write(chunk)
+
+                size_mb = save_path.stat().st_size / 1024 / 1024
+                if size_mb < 0.05:
+                    save_path.unlink(missing_ok=True)
+                    continue
+                print(f"    ✅ {save_path.name}  ({size_mb:.1f} MB)")
+                return save_path
+
+            # 收到 HTML → 可能是限速页面，换下一个镜像
+            if resp.status_code in (429, 403, 401):
+                print(f"    ⚠ 镜像{index} 返回 {resp.status_code}，换下一个…")
+                continue
+
+        except Exception as e:
+            print(f"    ⚠ 镜像{index} 出错：{e}")
             continue
+
     return None
-
-
-def download_file(url: str, title: str, session: requests.Session) -> Path | None:
-    """把文件下载到本地"""
-    try:
-        resp = session.get(url, timeout=120, stream=True)
-        if resp.status_code != 200:
-            return None
-
-        # 从 Content-Disposition 或 URL 猜扩展名
-        cd = resp.headers.get("content-disposition", "")
-        m = re.search(r'filename="?([^";\n]+)"?', cd)
-        fname = m.group(1).strip() if m else ""
-        ext = fname.rsplit(".", 1)[-1] if "." in fname else \
-              url.rsplit(".", 1)[-1].split("?")[0][:5] or "pdf"
-
-        save_path = DOWNLOAD_DIR / f"{safe_name(title)}.{ext}"
-        with open(save_path, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=65536):
-                f.write(chunk)
-
-        size_mb = save_path.stat().st_size / 1024 / 1024
-        if size_mb < 0.05:
-            save_path.unlink(missing_ok=True)
-            return None
-        print(f"    ✅ {save_path.name}  ({size_mb:.1f} MB)")
-        return save_path
-    except Exception as e:
-        print(f"    ⚠ 下载出错：{e}")
-        return None
 
 
 # ── 主流程 ────────────────────────────────────────────
@@ -181,22 +171,16 @@ def main():
 
         md5 = extract_md5(book["url"])
         if md5:
-            dl_url = get_download_url(md5, session)
+            result = try_download(md5, title, session)
         else:
-            # 没有 MD5，直接用 Excel 里的外部链接下载
-            dl_url = book["url"] if book["url"].startswith("http") else None
+            print(f"    ⚠ 无 MD5，跳过")
+            result = None
 
-        if not dl_url:
-            print(f"    ❌ 拿不到下载链接，跳过")
-            fail += 1
+        if result:
+            success += 1
+            mark_done(num)
         else:
-            result = download_file(dl_url, title, session)
-            if result:
-                success += 1
-                mark_done(num)
-            else:
-                print(f"    ❌ 下载失败")
-                fail += 1
+            fail += 1
 
         time.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
 
