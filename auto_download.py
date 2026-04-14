@@ -84,72 +84,105 @@ async def try_download(page, context, book_url: str, title: str) -> bool:
     """
     try:
         await page.goto(book_url, wait_until="domcontentloaded", timeout=30000)
-        await asyncio.sleep(random.uniform(1.0, 2.0))
+        await asyncio.sleep(random.uniform(1.5, 2.5))
 
-        # ── 方案A：找 /slow_download/ 链接（Anna's Archive 自有慢速下载）──
-        slow_links = await page.query_selector_all("a[href*='/slow_download/']")
-        if slow_links:
-            href = await slow_links[0].get_attribute("href")
-            if href:
-                dl_url = ("https://annas-archive.gl" + href
-                          if href.startswith("/") else href)
-                print(f"    → 慢速下载: {dl_url[:70]}")
-                # 监听下载事件
-                async with page.expect_download(timeout=60000) as dl_info:
-                    await page.goto(dl_url, wait_until="domcontentloaded",
-                                    timeout=30000)
+        # ── 调试：收集页面上所有链接，找下载相关的 ──────────────────────
+        all_links = await page.query_selector_all("a[href]")
+        download_candidates = []
+        for link in all_links:
+            href = await link.get_attribute("href") or ""
+            text = (await link.inner_text()).strip()[:30]
+            # 收集所有看起来像下载链接的
+            if any(kw in href for kw in [
+                "slow_download", "fast_download", "download",
+                "libgen", "library.lol", "b-ok", "zlibrary",
+                "z-lib", "1lib", "books.ms", "ipfs",
+            ]):
+                download_candidates.append((href, text))
+
+        if download_candidates:
+            print(f"    找到 {len(download_candidates)} 个候选链接")
+        else:
+            # 打印页面所有链接供调试（仅前10个）
+            print(f"    ⚠ 未找到下载候选，页面链接样本：")
+            for link in all_links[:10]:
+                href = await link.get_attribute("href") or ""
+                if href and not href.startswith("#"):
+                    print(f"       {href[:80]}")
+            return False
+
+        # ── 方案A：优先找 slow_download（Anna's Archive 自有）────────────
+        slow = [(h, t) for h, t in download_candidates if "slow_download" in h]
+        if slow:
+            href = slow[0][0]
+            dl_url = "https://annas-archive.gl" + href if href.startswith("/") else href
+            print(f"    → 慢速下载: {dl_url[:70]}")
+            try:
+                async with page.expect_download(timeout=90000) as dl_info:
+                    await page.goto(dl_url, wait_until="domcontentloaded", timeout=40000)
                 dl = await dl_info.value
-                save_path = DOWNLOAD_DIR / f"{safe_filename(title)}.{dl.suggested_filename.split('.')[-1]}"
+                ext = dl.suggested_filename.split(".")[-1] or "pdf"
+                save_path = DOWNLOAD_DIR / f"{safe_filename(title)}.{ext}"
                 await dl.save_as(save_path)
                 print(f"    ✅ 已保存: {save_path.name}")
                 return True
+            except Exception as e:
+                print(f"    ⚠ 慢速下载失败: {e}，尝试镜像...")
 
-        # ── 方案B：找镜像链接（libgen / library.lol 等）──────────────────
-        mirror_selectors = [
-            "a[href*='library.lol']",
-            "a[href*='libgen.']",
-            "a[href*='libgen.rs']",
-            "a[href*='libgen.is']",
-            "a[href*='b-ok.']",
-        ]
-        for sel in mirror_selectors:
-            els = await page.query_selector_all(sel)
-            if els:
-                href = await els[0].get_attribute("href") or ""
-                if not href:
-                    continue
-                print(f"    → 镜像站: {href[:70]}")
-                # 在新标签页打开镜像
-                new_page = await context.new_page()
-                try:
-                    await new_page.goto(href, wait_until="domcontentloaded",
-                                        timeout=30000)
-                    await asyncio.sleep(1.5)
-                    # libgen/library.lol 通常有 GET 或 download 按钮
-                    for btn_sel in [
-                        "a#download", "a[href*='get.php']",
-                        "a[href*='/get/']", "a.btn-primary",
-                        "a[href*='download']",
-                    ]:
-                        btns = await new_page.query_selector_all(btn_sel)
-                        if btns:
-                            async with new_page.expect_download(
-                                    timeout=60000) as dl_info:
+        # ── 方案B：镜像站（library.lol / libgen 等）─────────────────────
+        mirrors = [(h, t) for h, t in download_candidates
+                   if any(m in h for m in ["library.lol", "libgen", "b-ok", "z-lib", "books.ms"])]
+        for href, _ in mirrors[:3]:   # 最多试3个镜像
+            print(f"    → 镜像站: {href[:70]}")
+            new_page = await context.new_page()
+            try:
+                await new_page.goto(href, wait_until="domcontentloaded", timeout=30000)
+                await asyncio.sleep(2)
+
+                # 在镜像站找下载按钮
+                for btn_sel in [
+                    "a#download", "a[href*='get.php']", "a[href*='/get/']",
+                    "a.btn-success", "a.btn-primary", "input[value='GET']",
+                    "a[href*='download']", "a[href*='.pdf']", "a[href*='.epub']",
+                ]:
+                    btns = await new_page.query_selector_all(btn_sel)
+                    if btns:
+                        try:
+                            async with new_page.expect_download(timeout=60000) as dl_info:
                                 await btns[0].click()
                             dl = await dl_info.value
-                            ext = dl.suggested_filename.split(".")[-1]
+                            ext = dl.suggested_filename.split(".")[-1] or "pdf"
                             save_path = DOWNLOAD_DIR / f"{safe_filename(title)}.{ext}"
                             await dl.save_as(save_path)
                             print(f"    ✅ 已保存: {save_path.name}")
                             await new_page.close()
                             return True
-                except Exception as e:
-                    print(f"    ⚠ 镜像站出错: {e}")
-                finally:
-                    if not new_page.is_closed():
-                        await new_page.close()
+                        except Exception:
+                            continue
+            except Exception as e:
+                print(f"    ⚠ 镜像站失败: {e}")
+            finally:
+                if not new_page.is_closed():
+                    await new_page.close()
 
-        print(f"    ❌ 未找到可用下载链接")
+        # ── 方案C：其他 download 链接 ────────────────────────────────────
+        others = [(h, t) for h, t in download_candidates
+                  if "download" in h and h not in [x[0] for x in slow + mirrors]]
+        for href, _ in others[:2]:
+            print(f"    → 尝试: {href[:70]}")
+            try:
+                async with page.expect_download(timeout=60000) as dl_info:
+                    await page.goto(href, wait_until="domcontentloaded", timeout=30000)
+                dl = await dl_info.value
+                ext = dl.suggested_filename.split(".")[-1] or "pdf"
+                save_path = DOWNLOAD_DIR / f"{safe_filename(title)}.{ext}"
+                await dl.save_as(save_path)
+                print(f"    ✅ 已保存: {save_path.name}")
+                return True
+            except Exception:
+                continue
+
+        print(f"    ❌ 所有方案均失败")
         return False
 
     except PlaywrightTimeout:
@@ -157,7 +190,6 @@ async def try_download(page, context, book_url: str, title: str) -> bool:
         return False
     except Exception as e:
         print(f"    ⚠ 出错: {e}")
-        return False
 
 
 async def main():
