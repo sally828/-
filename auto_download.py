@@ -35,7 +35,12 @@ DELAY_MAX    = 4.0
 # ── 工具函数 ──────────────────────────────────────────
 
 def extract_md5(url: str) -> str | None:
-    m = re.search(r'/md5/([a-f0-9]{32})', str(url or ""), re.I)
+    # 匹配 /md5/、/slow_download/、/fast_download/ 后面的 MD5
+    m = re.search(r'/(?:md5|slow_download|fast_download)/([a-f0-9]{32})', str(url or ""), re.I)
+    if m:
+        return m.group(1).lower()
+    # 兜底：URL 里任意位置的 32 位十六进制串
+    m = re.search(r'\b([a-f0-9]{32})\b', str(url or ""), re.I)
     return m.group(1).lower() if m else None
 
 def safe_name(name: str) -> str:
@@ -142,7 +147,9 @@ def main():
     DOWNLOAD_DIR.mkdir(exist_ok=True)
     books   = load_books()
     done    = load_done()
-    pending = [b for b in books if b["序号"] not in done and extract_md5(b["url"])]
+    # 有 MD5 的走 API，没有 MD5 但有 URL 的直接下载外部链接
+    pending = [b for b in books if b["序号"] not in done
+               and (extract_md5(b["url"]) or b["url"].startswith("http"))]
 
     print(f"📚 共 {len(books)} 条 | 已完成 {len(done)} | 本次下载 {len(pending)} 条")
     print(f"📁 保存到: {DOWNLOAD_DIR}\n")
@@ -161,10 +168,15 @@ def main():
     success = fail = 0
     for i, book in enumerate(pending):
         num, title = book["序号"], book["书名"]
-        md5 = extract_md5(book["url"])
         print(f"[{i+1:4d}/{len(pending)}] #{num}  {title[:50]}")
 
-        dl_url = get_download_url(md5, session)
+        md5 = extract_md5(book["url"])
+        if md5:
+            dl_url = get_download_url(md5, session)
+        else:
+            # 没有 MD5，直接用 Excel 里的外部链接下载
+            dl_url = book["url"] if book["url"].startswith("http") else None
+
         if not dl_url:
             print(f"    ❌ 拿不到下载链接，跳过")
             fail += 1
