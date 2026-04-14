@@ -147,6 +147,15 @@ def main():
     DOWNLOAD_DIR.mkdir(exist_ok=True)
     books   = load_books()
     done    = load_done()
+
+    # 调试：统计链接情况
+    has_url   = [b for b in books if b["url"].startswith("http")]
+    has_md5   = [b for b in books if extract_md5(b["url"])]
+    no_url    = [b for b in books if not b["url"] or b["url"] == "点击下载"]
+    print(f"🔍 链接统计：有效URL={len(has_url)} | 含MD5={len(has_md5)} | 无链接={len(no_url)}")
+    if has_url:
+        print(f"   URL样例：{has_url[0]['url'][:80]}")
+
     # 有 MD5 的走 API，没有 MD5 但有 URL 的直接下载外部链接
     pending = [b for b in books if b["序号"] not in done
                and (extract_md5(b["url"]) or b["url"].startswith("http"))]
