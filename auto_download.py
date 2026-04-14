@@ -69,37 +69,43 @@ async def download_book(page, book: dict) -> bool:
 
     saved = []
 
-    async def on_response(response):
-        if saved:
+    async def intercept(route):
+        req_url = route.request.url
+        # Anna's Archive 本站请求直接放行
+        if "annas-archive" in req_url:
+            await route.continue_()
             return
-        ct = response.headers.get("content-type", "")
-        ru = response.url
-        # 拦截非 HTML 的大文件响应（PDF / EPUB 等）
-        if (response.status == 200
-                and "annas-archive" not in ru
-                and "html" not in ct
-                and "javascript" not in ct
-                and "css" not in ct):
+        # CDN 请求：fetch 拿到响应体，判断是否是文件
+        try:
+            resp = await route.fetch()
+            body = await resp.body()
+            ct   = resp.headers.get("content-type", "")
+            if len(body) > 50_000 and "html" not in ct:
+                ext = "epub" if "epub" in ct else "pdf"
+                sp  = DOWNLOAD_DIR / f"{safe_name(title)}.{ext}"
+                sp.write_bytes(body)
+                saved.append(sp)
+                # 告诉浏览器"下载完了"，不用再渲染 PDF
+                await route.fulfill(status=200, content_type="text/html",
+                                    body=b"<html><body>saved</body></html>")
+            else:
+                await route.fulfill(response=resp)
+        except Exception:
             try:
-                body = await response.body()
-                if len(body) > 50_000:
-                    ext = "epub" if "epub" in ct else "pdf"
-                    sp  = DOWNLOAD_DIR / f"{safe_name(title)}.{ext}"
-                    sp.write_bytes(body)
-                    saved.append(sp)
+                await route.continue_()
             except Exception:
                 pass
 
-    page.on("response", on_response)
+    await page.route("**/*", intercept)
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        for _ in range(15):        # 最多等 15 秒
+        for _ in range(15):
             if saved:
                 break
             await asyncio.sleep(1)
     except Exception:
         pass
-    page.remove_listener("response", on_response)
+    await page.unroute("**/*")
 
     if saved:
         sp = saved[0]
