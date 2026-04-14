@@ -60,51 +60,31 @@ def load_books() -> list[dict]:
 
 
 async def download_book(page, book: dict) -> bool:
-    url = book["url"]
-    md5 = extract_md5(url)
-    if not md5:
-        print(f"    ⚠ 无 MD5，跳过")
+    url  = book["url"]
+    title = book["书名"]
+
+    if not url.startswith("http"):
+        print(f"    ⚠ 无链接，跳过")
         return False
 
     try:
-        await page.goto(f"{BASE_URL}/md5/{md5}",
-                        wait_until="domcontentloaded", timeout=30000)
-        await asyncio.sleep(1.5)
-    except PlaywrightTimeout:
-        print(f"    ❌ 页面加载超时")
+        async with page.expect_download(timeout=30000) as dl_info:
+            await page.goto(url, wait_until="commit", timeout=30000)
+        dl = await dl_info.value
+        fname = dl.suggested_filename or ""
+        ext   = fname.rsplit(".", 1)[-1] if "." in fname else "pdf"
+        save_path = DOWNLOAD_DIR / f"{safe_name(title)}.{ext}"
+        await dl.save_as(save_path)
+        size_mb = save_path.stat().st_size / 1024 / 1024
+        if size_mb < 0.05:
+            save_path.unlink(missing_ok=True)
+            print(f"    ❌ 文件太小，可能未登录")
+            return False
+        print(f"    ✅ {save_path.name}  ({size_mb:.1f} MB)")
+        return True
+    except Exception as e:
+        print(f"    ❌ {e}")
         return False
-
-    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-    await asyncio.sleep(0.8)
-
-    # 找 Fast Download 按钮
-    for sel in ["a[href*='/fast_download/']", "a:text-matches('fast download', 'i')"]:
-        btn = await page.query_selector(sel)
-        if not btn:
-            continue
-        href = await btn.get_attribute("href") or ""
-        if any(x in href for x in ["/account/", "javascript:", "#"]):
-            continue
-        try:
-            save_path = DOWNLOAD_DIR / f"{safe_name(book['书名'])}.pdf"
-            async with page.expect_download(timeout=30000) as dl_info:
-                await btn.click()
-            dl = await dl_info.value
-            fname = dl.suggested_filename
-            ext = fname.rsplit(".", 1)[-1] if "." in fname else "pdf"
-            save_path = DOWNLOAD_DIR / f"{safe_name(book['书名'])}.{ext}"
-            await dl.save_as(save_path)
-            size_mb = save_path.stat().st_size / 1024 / 1024
-            if size_mb < 0.05:
-                save_path.unlink(missing_ok=True)
-                return False
-            print(f"    ✅ {save_path.name}  ({size_mb:.1f} MB)")
-            return True
-        except Exception:
-            continue
-
-    print(f"    ❌ 未找到下载按钮")
-    return False
 
 
 async def main():
