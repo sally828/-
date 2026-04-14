@@ -163,6 +163,8 @@ def main():
                       "AppleWebKit/537.36 (KHTML, like Gecko) "
                       "Chrome/121.0.0.0 Safari/537.36",
     })
+    if PROXY:
+        session.proxies = {"http": PROXY, "https": PROXY}
 
     success = fail = 0
     for i, book in enumerate(pending):
