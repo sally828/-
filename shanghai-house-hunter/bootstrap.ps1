@@ -334,11 +334,13 @@ if __name__ == "__main__":
     main()
 '@ | Set-Content -Encoding UTF8 auto_download.py
 
-# ── 将 auto_download.py 复制到用户主目录，方便直接调用 ──────────────────────
-$userHome = [Environment]::GetFolderPath("UserProfile")
-Write-Host "`n复制 auto_download.py 到 $userHome ..." -ForegroundColor Cyan
-Copy-Item -Path "$dir\auto_download.py" -Destination "$userHome\auto_download.py" -Force
-Write-Host "  ✓ 已复制到 $userHome\auto_download.py" -ForegroundColor Green
+# ── 将 auto_download.py 复制到桌面的"搜索"文件夹 ──────────────────────────
+$desktop   = [Environment]::GetFolderPath("Desktop")
+$searchDir = Join-Path $desktop "搜索"
+New-Item -ItemType Directory -Force -Path $searchDir | Out-Null
+Write-Host "`n复制 auto_download.py 到 $searchDir ..." -ForegroundColor Cyan
+Copy-Item -Path "$dir\auto_download.py" -Destination "$searchDir\auto_download.py" -Force
+Write-Host "  ✓ 已复制到 $searchDir\auto_download.py" -ForegroundColor Green
 
 # ── 安装 Python 依赖 ────────────────────────────────────────────────────────
 Write-Host "`n安装 Python 依赖包 ..." -ForegroundColor Cyan
@@ -350,7 +352,8 @@ python setup_feishu.py
 
 # ── 完成提示 ────────────────────────────────────────────────────────────────
 Write-Host "`n============================================" -ForegroundColor Green
-Write-Host "  完成！可直接运行：" -ForegroundColor Green
+Write-Host "  完成！在桌面搜索文件夹中运行：" -ForegroundColor Green
+Write-Host "  cd `"$searchDir`"" -ForegroundColor Yellow
 Write-Host "  python auto_download.py" -ForegroundColor Yellow
 Write-Host "" -ForegroundColor Green
 Write-Host "  或进入项目目录运行交互菜单：" -ForegroundColor Green
