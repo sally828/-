@@ -147,7 +147,7 @@ async def fast_download(page, md5: str, title: str) -> Path | None:
             if any(p in href for p in INVALID_PATTERNS):
                 continue
             try:
-                async with page.expect_download(timeout=120000) as dl_info:
+                async with page.expect_download(timeout=30000) as dl_info:
                     await btn.click()
                 dl = await dl_info.value
                 fname = dl.suggested_filename
@@ -269,6 +269,8 @@ async def main():
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 f"--proxy-server={PROXY}",
+                "--disable-pdf-viewer",          # 强制 PDF 触发下载而非在浏览器内打开
+                "--disable-plugins",
             ],
         )
         ctx = await browser.new_context(
