@@ -1,40 +1,164 @@
 #!/usr/bin/env python3
 """
-Anna's Archive 自动下载脚本 v3
-读取 书目搜索结果.xlsx，逐本找到真实下载链接并下载
+Anna's Archive 自动下载脚本 v4（官方 JSON API 版）
+不需要打开浏览器，直接通过 API 获取下载链接并保存文件
 
+运行前：把下面的"你的密钥粘贴在这里"替换成真实密钥（见注释）
 运行：python auto_download.py
 """
 
-import asyncio
-import random
 import re
+import time
+import random
 from pathlib import Path
 
+import requests
 import openpyxl
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
-# ── 配置 ──────────────────────────────────────────────────────────────────────
-PROXY        = "http://127.0.0.1:10808"
+# ══════════════════════════════════════════════════════════════════════════════
+#  只需要改这一行 ↓↓↓
+# ══════════════════════════════════════════════════════════════════════════════
+API_KEY = "你的密钥粘贴在这里"
+# 获取方式：用浏览器打开 annas-archive.gl → 登录账号 → 进入"账户"页面
+#           找到"密钥（请勿分享！）："那一行，点"显示"，复制那串字符粘贴到上面
+# ══════════════════════════════════════════════════════════════════════════════
+
 EXCEL_FILE   = "书目搜索结果.xlsx"
 DOWNLOAD_DIR = Path("下载书籍")
 DONE_FILE    = "downloaded.txt"
-HEADLESS     = False
-DELAY_MIN    = 3.0
-DELAY_MAX    = 6.0
+PROXY        = "http://127.0.0.1:10808"   # V2RayN 代理，不用改
 BASE_URL     = "https://annas-archive.gl"
-# ─────────────────────────────────────────────────────────────────────────────
 
-MIRROR_KEYWORDS = [
-    "libgen.rs", "libgen.is", "libgen.li",
-    "library.lol", "b-ok.", "z-lib.", "zlibrary",
-    "books.ms", "ipfs", "slow_download", "sci-hub",
-]
-SKIP_KEYWORDS = ["/account/", "/search", "/datasets", "/db/",
-                 "javascript:", "#", "/donate", "/faq", "/blog"]
+PROXIES = {"http": PROXY, "https": PROXY}
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/121.0.0.0 Safari/537.36"
+    )
+}
+
+# 这些链接是无效的，跳过
+INVALID_PATTERNS = ["/account/", "javascript:", "annas-archive.gl/#",
+                    "/donate", "/faq", "/blog", "/search", "/datasets"]
 
 
-def load_links():
+# ── 工具函数 ──────────────────────────────────────────────────────────────────
+
+def extract_md5(url: str) -> str | None:
+    """从 URL 中提取 32 位 MD5 哈希值"""
+    m = re.search(r'/md5/([a-f0-9]{32})', url, re.I)
+    if m:
+        return m.group(1).lower()
+    m = re.search(r'[?&]md5=([a-f0-9]{32})', url, re.I)
+    if m:
+        return m.group(1).lower()
+    return None
+
+
+def safe_name(name: str) -> str:
+    return re.sub(r'[\\/:*?"<>|]', '_', name)[:80].strip()
+
+
+def is_invalid_url(url: str) -> bool:
+    if not url or not url.startswith("http"):
+        return True
+    return any(p in url for p in INVALID_PATTERNS)
+
+
+# ── API 调用 ──────────────────────────────────────────────────────────────────
+
+def get_fast_download_url(md5: str) -> str | None:
+    """调用官方 JSON API，返回直链；失败返回 None"""
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/dyn/api/fast_download.json",
+            params={"md5": md5, "key": API_KEY},
+            headers=HEADERS,
+            proxies=PROXIES,
+            timeout=20,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            # 兼容多种可能的响应格式
+            for key in ("download_urls", "urls"):
+                if isinstance(data.get(key), list) and data[key]:
+                    return data[key][0]
+            for key in ("url", "download_url", "link"):
+                if data.get(key):
+                    return data[key]
+            print(f"      ⚠ API 返回未知格式: {list(data.keys())}")
+        elif resp.status_code == 401:
+            print(f"      ❌ API 密钥无效，请检查 API_KEY 是否填写正确")
+        elif resp.status_code == 429:
+            print(f"      ⏳ 下载次数已用完（每 18 小时 1000 次），请稍后再试")
+        else:
+            print(f"      ⚠ API 返回 {resp.status_code}: {resp.text[:120]}")
+    except Exception as e:
+        print(f"      ⚠ API 请求失败: {e}")
+    return None
+
+
+# ── 文件下载 ──────────────────────────────────────────────────────────────────
+
+def download_file(url: str, save_base: Path) -> bool:
+    """流式下载文件，自动推断扩展名；成功返回 True"""
+    try:
+        resp = requests.get(
+            url, headers=HEADERS, proxies=PROXIES,
+            stream=True, timeout=120, allow_redirects=True,
+        )
+        resp.raise_for_status()
+
+        # 从响应头推断格式
+        ext = "pdf"
+        ct = resp.headers.get("Content-Type", "").lower()
+        if "epub" in ct:
+            ext = "epub"
+        elif "mobi" in ct or "mobipocket" in ct:
+            ext = "mobi"
+        elif "djvu" in ct:
+            ext = "djvu"
+
+        # Content-Disposition 优先级更高
+        cd = resp.headers.get("Content-Disposition", "")
+        m = re.search(r'filename[^;=\n]*=["\']?([^"\'\n;]+)', cd)
+        if m:
+            orig = m.group(1).strip().strip('"\'')
+            if "." in orig:
+                candidate = orig.rsplit(".", 1)[-1].lower()
+                if candidate in ("pdf", "epub", "mobi", "djvu", "azw3",
+                                 "fb2", "doc", "docx", "txt"):
+                    ext = candidate
+
+        save_path = save_base.parent / f"{save_base.name}.{ext}"
+
+        # 如果同名文件已存在（可能是上次未完成），先删掉
+        if save_path.exists():
+            save_path.unlink()
+
+        with open(save_path, "wb") as f:
+            for chunk in resp.iter_content(65536):
+                if chunk:
+                    f.write(chunk)
+
+        size_mb = save_path.stat().st_size / 1024 / 1024
+        if size_mb < 0.01:
+            print(f"      ⚠ 文件过小（{size_mb:.2f} MB），可能下载失败")
+            save_path.unlink()
+            return False
+
+        print(f"      ✅ {save_path.name}  ({size_mb:.1f} MB)")
+        return True
+
+    except Exception as e:
+        print(f"      ❌ 下载失败: {e}")
+        return False
+
+
+# ── Excel 读取 ────────────────────────────────────────────────────────────────
+
+def load_books() -> list[dict]:
     wb = openpyxl.load_workbook(EXCEL_FILE)
     ws = wb.active
     headers = [c.value for c in ws[1]]
@@ -44,187 +168,110 @@ def load_links():
         for i, cell in enumerate(row):
             if i < len(headers) and headers[i]:
                 data[headers[i]] = cell.hyperlink.target if cell.hyperlink else cell.value
-        url  = data.get("下载链接", "") or ""
-        num  = data.get("序号", "")
-        name = data.get("找到书名", "") or data.get("原书名", "") or f"书_{num}"
-
-        if not url or not isinstance(url, str):
-            continue
-        # 跳过无效链接
-        if any(skip in url for skip in SKIP_KEYWORDS):
-            continue
-        if not url.startswith("http"):
-            continue
-
-        rows.append({"序号": str(num), "书名": str(name), "url": url})
+        num  = str(data.get("序号", "") or "").strip()
+        name = str(data.get("找到书名", "") or data.get("原书名", "") or f"书_{num}").strip()
+        url  = str(data.get("下载链接", "") or "").strip()
+        if num:
+            rows.append({"序号": num, "书名": name, "url": url})
     return rows
 
 
-def load_done():
+def load_done() -> set:
     if Path(DONE_FILE).exists():
         return set(Path(DONE_FILE).read_text(encoding="utf-8").splitlines())
     return set()
 
 
-def mark_done(num):
+def mark_done(num: str):
     with open(DONE_FILE, "a", encoding="utf-8") as f:
         f.write(num + "\n")
 
 
-def safe_name(name):
-    return re.sub(r'[\\/:*?"<>|]', '_', name)[:80].strip()
+# ── 单本处理 ──────────────────────────────────────────────────────────────────
+
+def process_book(book: dict) -> bool:
+    url   = book["url"]
+    title = book["书名"]
+    save_base = DOWNLOAD_DIR / safe_name(title)
+
+    # 无效链接
+    if is_invalid_url(url):
+        print(f"    ⚠ 链接无效，跳过（需要重新运行 search_anna.py）")
+        return False
+
+    # 有 MD5 → 调用 API
+    md5 = extract_md5(url)
+    if md5:
+        print(f"    → API 快速下载 (md5={md5[:8]}…)")
+        dl_url = get_fast_download_url(md5)
+        if dl_url:
+            print(f"    → {dl_url[:75]}")
+            return download_file(dl_url, save_base)
+        return False
+
+    # 无 MD5（直接镜像链接）→ 尝试直接下载
+    print(f"    → 直接下载: {url[:65]}")
+    return download_file(url, save_base)
 
 
-async def get_mirror_links(page):
-    """在 Anna's Archive 详情页找镜像下载链接"""
-    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-    await asyncio.sleep(1)
+# ── 主流程 ────────────────────────────────────────────────────────────────────
 
-    all_links = await page.query_selector_all("a[href]")
-    mirrors = []
-    for el in all_links:
-        href = await el.get_attribute("href") or ""
-        if any(skip in href for skip in SKIP_KEYWORDS):
-            continue
-        if any(kw in href for kw in MIRROR_KEYWORDS):
-            mirrors.append(href if href.startswith("http") else BASE_URL + href)
-    return mirrors
-
-
-async def download_from_mirror(context, mirror_url, title):
-    """在镜像站点击下载，返回保存路径或 None"""
-    page = await context.new_page()
-    try:
-        await page.goto(mirror_url, wait_until="domcontentloaded", timeout=30000)
-        await asyncio.sleep(2)
-
-        # libgen / library.lol 下载按钮选择器
-        btn_selectors = [
-            "a#download",
-            "a[href*='get.php']",
-            "a[href*='/get/']",
-            "a[href*='/download/']",
-            "a.btn-success",
-            "a.btn-primary",
-            "a[href$='.pdf']",
-            "a[href$='.epub']",
-            "a[href$='.mobi']",
-            "a[href$='.djvu']",
-        ]
-        for sel in btn_selectors:
-            btns = await page.query_selector_all(sel)
-            for btn in btns:
-                href = await btn.get_attribute("href") or ""
-                if any(skip in href for skip in SKIP_KEYWORDS):
-                    continue
-                try:
-                    async with page.expect_download(timeout=90000) as dl_info:
-                        await btn.click()
-                    dl = await dl_info.value
-                    ext = dl.suggested_filename.rsplit(".", 1)[-1] or "pdf"
-                    save_path = DOWNLOAD_DIR / f"{safe_name(title)}.{ext}"
-                    await dl.save_as(save_path)
-                    return save_path
-                except Exception:
-                    continue
-    except Exception as e:
-        print(f"      镜像站出错: {e}")
-    finally:
-        if not page.is_closed():
-            await page.close()
-    return None
-
-
-async def process_book(page, context, url, title):
-    """处理一本书的下载流程"""
-
-    # ── Case 1: 已经是镜像直链 ─────────────────────────────────────
-    if any(kw in url for kw in MIRROR_KEYWORDS) and "/md5/" not in url:
-        print(f"    → 直接镜像链接")
-        result = await download_from_mirror(context, url, title)
-        if result:
-            print(f"    ✅ {result.name}")
-            return True
-
-    # ── Case 2: Anna's Archive 详情页 /md5/ ─────────────────────────
-    if "/md5/" in url or "annas-archive" in url:
-        # 确保是详情页
-        if "/md5/" not in url:
-            print(f"    ⚠ 非详情页 URL，跳过: {url[:60]}")
-            return False
-
-        print(f"    → 打开详情页...")
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(1.5)
-        except PlaywrightTimeout:
-            print(f"    ⏱ 详情页超时")
-            return False
-
-        mirrors = await get_mirror_links(page)
-        if not mirrors:
-            print(f"    ❌ 详情页无镜像链接")
-            return False
-
-        print(f"    找到 {len(mirrors)} 个镜像链接")
-        for m_url in mirrors[:3]:
-            print(f"    → 尝试: {m_url[:65]}")
-            result = await download_from_mirror(context, m_url, title)
-            if result:
-                print(f"    ✅ {result.name}")
-                return True
-
-    print(f"    ❌ 所有方案失败")
-    return False
-
-
-async def main():
-    DOWNLOAD_DIR.mkdir(exist_ok=True)
-    books = load_links()
-    done  = load_done()
-    pending = [b for b in books if b["序号"] not in done]
-
-    print(f"📚 共 {len(books)} 条 | 已完成 {len(done)} | 待处理 {len(pending)}")
-    print(f"📁 保存到: {DOWNLOAD_DIR.absolute()}\n")
-
-    if not pending:
-        print("✅ 全部完成！")
+def main():
+    # 检查密钥
+    if API_KEY == "你的密钥粘贴在这里" or not API_KEY.strip():
+        print("=" * 60)
+        print("❌ 还没有填写 API 密钥，脚本无法运行")
+        print()
+        print("操作步骤：")
+        print("  1. 用记事本打开 auto_download.py")
+        print('  2. 找到这一行：API_KEY = "你的密钥粘贴在这里"')
+        print("  3. 把引号里的文字替换成从账户页面复制的密钥")
+        print("  4. 保存文件（Ctrl+S），重新运行")
+        print("=" * 60)
         return
 
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=HEADLESS,
-            args=["--disable-blink-features=AutomationControlled",
-                  "--no-sandbox", f"--proxy-server={PROXY}"],
-        )
-        ctx = await browser.new_context(
-            user_agent=("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/121.0.0.0 Safari/537.36"),
-            viewport={"width": 1366, "height": 800},
-            locale="zh-CN",
-            accept_downloads=True,
-        )
-        page = await ctx.new_page()
+    DOWNLOAD_DIR.mkdir(exist_ok=True)
+    books = load_books()
+    done  = load_done()
 
-        success = fail = 0
-        for i, book in enumerate(pending):
-            num, title, url = book["序号"], book["书名"], book["url"]
-            print(f"[{i+1:4d}/{len(pending)}] #{num} {title[:45]}")
+    all_pending  = [b for b in books if b["序号"] not in done]
+    invalid_books = [b for b in all_pending if is_invalid_url(b["url"])]
+    valid_books   = [b for b in all_pending if not is_invalid_url(b["url"])]
 
-            ok = await process_book(page, ctx, url, title)
-            if ok:
-                success += 1
-                mark_done(num)
-            else:
-                fail += 1
+    print(f"📚 共 {len(books)} 条 | 已完成 {len(done)} | 待处理 {len(all_pending)}")
+    if invalid_books:
+        print(f"⚠  {len(invalid_books)} 条链接无效（旧版脚本生成，运行 search_anna.py 可修复）")
+    print(f"🔗 可下载: {len(valid_books)} 条")
+    print(f"📁 保存到: {DOWNLOAD_DIR.absolute()}")
+    print()
 
-            await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
+    if not valid_books:
+        if invalid_books:
+            print("💡 提示：请重新运行 search_anna.py 更新下载链接，然后再运行本脚本")
+        else:
+            print("✅ 全部完成！")
+        return
 
-        await browser.close()
+    success = fail = 0
+    for i, book in enumerate(valid_books):
+        num, title = book["序号"], book["书名"]
+        print(f"[{i+1:4d}/{len(valid_books)}] #{num}  {title[:50]}")
 
-    print(f"\n🎉 完成！成功 {success} | 失败 {fail}")
+        ok = process_book(book)
+        if ok:
+            success += 1
+            mark_done(num)
+        else:
+            fail += 1
+
+        # 下载间隔（API 有次数限制，稍微等一下）
+        time.sleep(random.uniform(0.5, 1.5))
+
+    print()
+    print(f"🎉 完成！成功 {success} | 失败 {fail}")
+    if invalid_books:
+        print(f"💡 还有 {len(invalid_books)} 条需要重新搜索，运行 search_anna.py 后可继续")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
