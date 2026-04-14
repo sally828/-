@@ -26,6 +26,9 @@ EXCEL_FILE   = _HERE / "书目搜索结果.xlsx"
 DOWNLOAD_DIR = _HERE / "下载书籍"
 DONE_FILE    = _HERE / "downloaded.txt"
 
+# 需要拦截的书籍文件类型
+FILE_TYPES = ["pdf", "epub", "mobi", "djvu", "azw3", "azw", "fb2", "cbz", "cbr"]
+
 
 def extract_md5(url: str) -> str | None:
     m = re.search(r'[a-f0-9]{32}', str(url or ""), re.I)
@@ -67,9 +70,73 @@ async def download_book(page, book: dict) -> bool:
         print(f"    ⚠ 无链接，跳过")
         return False
 
+    # ── 方法一：路由拦截 ──────────────────────────────
+    # 在请求到达浏览器之前拦截，直接取出 PDF/EPUB 字节存盘
+    # 不依赖任何界面元素，最可靠
+    saved     = asyncio.Event()
+    file_info = {}
+
+    async def intercept(route, request):
+        # 只处理可能携带书籍内容的资源类型
+        if request.resource_type not in ("document", "other", "fetch", "xhr", "media"):
+            await route.continue_()
+            return
+        try:
+            response = await route.fetch()
+            ct      = response.headers.get("content-type", "").lower()
+            req_url = request.url.lower()
+            is_book = (
+                any(t in ct for t in FILE_TYPES)
+                or any(req_url.endswith(f".{t}") for t in FILE_TYPES)
+            )
+            if is_book and not saved.is_set():
+                body = await response.body()
+                if len(body) > 10_000:          # 至少 10 KB 才算有效文件
+                    ext = next(
+                        (t for t in FILE_TYPES if t in ct or req_url.endswith(f".{t}")),
+                        "pdf"
+                    )
+                    sp = DOWNLOAD_DIR / f"{safe_name(title)}.{ext}"
+                    sp.write_bytes(body)
+                    file_info["path"] = sp
+                    saved.set()
+                    await route.abort()         # 已存盘，不再让浏览器渲染
+                    return
+            await route.fulfill(response=response)
+        except Exception:
+            try:
+                await route.continue_()
+            except Exception:
+                pass
+
+    await page.route("**/*", intercept)
     try:
-        async with page.expect_download(timeout=60000) as dl_info:
-            await page.goto(url, wait_until="commit", timeout=30000)
+        # wait_until="commit" 在 URL 跳转后即返回，
+        # 避免因 route.abort() 导致 goto 超时
+        await page.goto(url, wait_until="commit", timeout=30000)
+    except Exception:
+        pass  # route.abort() 可能使导航抛异常，属正常情况
+    try:
+        await asyncio.wait_for(saved.wait(), timeout=25)
+    except asyncio.TimeoutError:
+        pass
+    await page.unroute("**/*", intercept)
+
+    if "path" in file_info and file_info["path"].exists():
+        size_mb = file_info["path"].stat().st_size / 1024 / 1024
+        if size_mb < 0.05:
+            file_info["path"].unlink(missing_ok=True)
+            print(f"    ❌ 文件太小")
+            return False
+        print(f"    ✅ {file_info['path'].name}  ({size_mb:.1f} MB)")
+        return True
+
+    # ── 方法二：点击 PDF 查看器里的 ↓ 下载按钮（兜底）──
+    # 当路由拦截未捕获到文件时（浏览器已把 PDF 渲染成查看器），
+    # 通过 shadow DOM 点击右上角的下载箭头
+    try:
+        async with page.expect_download(timeout=20000) as dl_info:
+            await page.locator("pdf-viewer").shadow_locator("#download").click()
         dl = await dl_info.value
         fname = dl.suggested_filename or f"{safe_name(title)}.pdf"
         ext   = fname.rsplit(".", 1)[-1] if "." in fname else "pdf"
@@ -103,8 +170,6 @@ async def main():
         args = [
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
-            "--disable-pdf-viewer",   # 强制 PDF 触发下载而非在浏览器内打开
-            "--disable-plugins",
         ]
         if PROXY:
             args.append(f"--proxy-server={PROXY}")
@@ -130,14 +195,6 @@ async def main():
         print("=" * 55)
         input(">>> 登录完成，按 Enter 开始下载：")
         print()
-
-        # 告诉 Chrome：所有文件强制下载，不要在浏览器里打开（包括 PDF）
-        cdp = await ctx.new_cdp_session(page)
-        await cdp.send("Browser.setDownloadBehavior", {
-            "behavior":      "allow",
-            "downloadPath":  str(DOWNLOAD_DIR.absolute()),
-            "eventsEnabled": True,
-        })
 
         success = fail = 0
         for i, book in enumerate(pending):
