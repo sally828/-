@@ -60,31 +60,55 @@ def load_books() -> list[dict]:
 
 
 async def download_book(page, book: dict) -> bool:
-    url  = book["url"]
+    url   = book["url"]
     title = book["书名"]
 
     if not url.startswith("http"):
         print(f"    ⚠ 无链接，跳过")
         return False
 
+    saved = []
+
+    async def on_response(response):
+        if saved:
+            return
+        ct = response.headers.get("content-type", "")
+        ru = response.url
+        # 拦截非 HTML 的大文件响应（PDF / EPUB 等）
+        if (response.status == 200
+                and "annas-archive" not in ru
+                and "html" not in ct
+                and "javascript" not in ct
+                and "css" not in ct):
+            try:
+                body = await response.body()
+                if len(body) > 50_000:
+                    ext = "epub" if "epub" in ct else "pdf"
+                    sp  = DOWNLOAD_DIR / f"{safe_name(title)}.{ext}"
+                    sp.write_bytes(body)
+                    saved.append(sp)
+            except Exception:
+                pass
+
+    page.on("response", on_response)
     try:
-        async with page.expect_download(timeout=30000) as dl_info:
-            await page.goto(url, wait_until="commit", timeout=30000)
-        dl = await dl_info.value
-        fname = dl.suggested_filename or ""
-        ext   = fname.rsplit(".", 1)[-1] if "." in fname else "pdf"
-        save_path = DOWNLOAD_DIR / f"{safe_name(title)}.{ext}"
-        await dl.save_as(save_path)
-        size_mb = save_path.stat().st_size / 1024 / 1024
-        if size_mb < 0.05:
-            save_path.unlink(missing_ok=True)
-            print(f"    ❌ 文件太小，可能未登录")
-            return False
-        print(f"    ✅ {save_path.name}  ({size_mb:.1f} MB)")
+        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+        for _ in range(15):        # 最多等 15 秒
+            if saved:
+                break
+            await asyncio.sleep(1)
+    except Exception:
+        pass
+    page.remove_listener("response", on_response)
+
+    if saved:
+        sp = saved[0]
+        size_mb = sp.stat().st_size / 1024 / 1024
+        print(f"    ✅ {sp.name}  ({size_mb:.1f} MB)")
         return True
-    except Exception as e:
-        print(f"    ❌ {e}")
-        return False
+
+    print(f"    ❌ 未能下载")
+    return False
 
 
 async def main():
