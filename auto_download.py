@@ -67,54 +67,24 @@ async def download_book(page, book: dict) -> bool:
         print(f"    ⚠ 无链接，跳过")
         return False
 
-    saved = []
-
-    async def intercept(route):
-        req_url = route.request.url
-        # Anna's Archive 本站请求直接放行
-        if "annas-archive" in req_url:
-            await route.continue_()
-            return
-        # CDN 请求：fetch 拿到响应体，判断是否是文件
-        try:
-            resp = await route.fetch()
-            body = await resp.body()
-            ct   = resp.headers.get("content-type", "")
-            if len(body) > 50_000 and "html" not in ct:
-                ext = "epub" if "epub" in ct else "pdf"
-                sp  = DOWNLOAD_DIR / f"{safe_name(title)}.{ext}"
-                sp.write_bytes(body)
-                saved.append(sp)
-                # 告诉浏览器"下载完了"，不用再渲染 PDF
-                await route.fulfill(status=200, content_type="text/html",
-                                    body=b"<html><body>saved</body></html>")
-            else:
-                await route.fulfill(response=resp)
-        except Exception:
-            try:
-                await route.continue_()
-            except Exception:
-                pass
-
-    await page.route("**/*", intercept)
     try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-        for _ in range(15):
-            if saved:
-                break
-            await asyncio.sleep(1)
-    except Exception:
-        pass
-    await page.unroute("**/*")
-
-    if saved:
-        sp = saved[0]
-        size_mb = sp.stat().st_size / 1024 / 1024
-        print(f"    ✅ {sp.name}  ({size_mb:.1f} MB)")
+        async with page.expect_download(timeout=60000) as dl_info:
+            await page.goto(url, wait_until="commit", timeout=30000)
+        dl = await dl_info.value
+        fname = dl.suggested_filename or f"{safe_name(title)}.pdf"
+        ext   = fname.rsplit(".", 1)[-1] if "." in fname else "pdf"
+        save_path = DOWNLOAD_DIR / f"{safe_name(title)}.{ext}"
+        await dl.save_as(save_path)
+        size_mb = save_path.stat().st_size / 1024 / 1024
+        if size_mb < 0.05:
+            save_path.unlink(missing_ok=True)
+            print(f"    ❌ 文件太小")
+            return False
+        print(f"    ✅ {save_path.name}  ({size_mb:.1f} MB)")
         return True
-
-    print(f"    ❌ 未能下载")
-    return False
+    except Exception as e:
+        print(f"    ❌ {e}")
+        return False
 
 
 async def main():
@@ -160,6 +130,14 @@ async def main():
         print("=" * 55)
         input(">>> 登录完成，按 Enter 开始下载：")
         print()
+
+        # 告诉 Chrome：所有文件强制下载，不要在浏览器里打开（包括 PDF）
+        cdp = await ctx.new_cdp_session(page)
+        await cdp.send("Browser.setDownloadBehavior", {
+            "behavior":      "allow",
+            "downloadPath":  str(DOWNLOAD_DIR.absolute()),
+            "eventsEnabled": True,
+        })
 
         success = fail = 0
         for i, book in enumerate(pending):
