@@ -103,16 +103,59 @@ def get_fast_download_url(md5: str) -> str | None:
 
 def download_file(url: str, save_base: Path) -> bool:
     """流式下载文件，自动推断扩展名；成功返回 True"""
+    # Anna's Archive fast_download 链接需要带上 API key
+    params = {}
+    if "annas-archive" in url and API_KEY and API_KEY != "你的密钥粘贴在这里":
+        params["key"] = API_KEY
+
     try:
         resp = requests.get(
             url, headers=HEADERS, proxies=PROXIES,
+            params=params,
             stream=True, timeout=120, allow_redirects=True,
         )
         resp.raise_for_status()
 
-        # 从响应头推断格式
-        ext = "pdf"
+        # ── 验证是真正的文件而非网页 ─────────────────────────────────
         ct = resp.headers.get("Content-Type", "").lower()
+        if "text/html" in ct or "text/plain" in ct:
+            print(f"      ❌ 服务器返回的是网页而非书籍（Content-Type: {ct}）")
+            return False
+
+        # 读取前 512 字节检查文件头（magic bytes）
+        first_chunk = b""
+        chunks = []
+        for chunk in resp.iter_content(65536):
+            if chunk:
+                if not first_chunk:
+                    first_chunk = chunk
+                    head = first_chunk[:16].lower()
+                    # HTML 页面标志
+                    if head.startswith(b"<!doctype") or head.startswith(b"<html"):
+                        print(f"      ❌ 下载内容是 HTML 网页，不是书籍文件（密钥可能需要随 URL 传递）")
+                        return False
+                    # 检查已知书籍格式：PDF / EPUB(zip) / MOBI / DJVU
+                    is_book = (
+                        first_chunk[:4] == b"%PDF" or          # PDF
+                        first_chunk[:2] == b"PK"   or          # EPUB / ZIP
+                        b"BOOKMOBI" in first_chunk[:16] or     # MOBI
+                        first_chunk[:4] == b"AT&T" or          # DJVU
+                        first_chunk[:4] == b"\xd0\xcf\x11\xe0" # DOC
+                    )
+                    if not is_book:
+                        # 不是已知格式，检查内容是否含 HTML 标签
+                        sample = first_chunk[:512]
+                        if b"<html" in sample or b"<body" in sample or b"cloudflare" in sample.lower():
+                            print(f"      ❌ 内容疑似网页（文件头: {first_chunk[:8]!r}）")
+                            return False
+                chunks.append(chunk)
+
+        if not chunks:
+            print(f"      ❌ 响应为空")
+            return False
+
+        # ── 推断扩展名 ───────────────────────────────────────────────
+        ext = "pdf"
         if "epub" in ct:
             ext = "epub"
         elif "mobi" in ct or "mobipocket" in ct:
@@ -120,7 +163,6 @@ def download_file(url: str, save_base: Path) -> bool:
         elif "djvu" in ct:
             ext = "djvu"
 
-        # Content-Disposition 优先级更高
         cd = resp.headers.get("Content-Disposition", "")
         m = re.search(r'filename[^;=\n]*=["\']?([^"\'\n;]+)', cd)
         if m:
@@ -128,23 +170,26 @@ def download_file(url: str, save_base: Path) -> bool:
             if "." in orig:
                 candidate = orig.rsplit(".", 1)[-1].lower()
                 if candidate in ("pdf", "epub", "mobi", "djvu", "azw3",
-                                 "fb2", "doc", "docx", "txt"):
+                                 "fb2", "doc", "docx"):
                     ext = candidate
 
-        save_path = save_base.parent / f"{save_base.name}.{ext}"
+        # 根据文件头二次确认格式
+        if first_chunk[:4] == b"%PDF":
+            ext = "pdf"
+        elif first_chunk[:2] == b"PK":
+            ext = "epub"
 
-        # 如果同名文件已存在（可能是上次未完成），先删掉
+        save_path = save_base.parent / f"{save_base.name}.{ext}"
         if save_path.exists():
             save_path.unlink()
 
         with open(save_path, "wb") as f:
-            for chunk in resp.iter_content(65536):
-                if chunk:
-                    f.write(chunk)
+            for c in chunks:
+                f.write(c)
 
         size_mb = save_path.stat().st_size / 1024 / 1024
-        if size_mb < 0.01:
-            print(f"      ⚠ 文件过小（{size_mb:.2f} MB），可能下载失败")
+        if size_mb < 0.05:
+            print(f"      ❌ 文件过小（{size_mb:.2f} MB），可能是错误页面")
             save_path.unlink()
             return False
 
@@ -185,6 +230,41 @@ def load_done() -> set:
 def mark_done(num: str):
     with open(DONE_FILE, "a", encoding="utf-8") as f:
         f.write(num + "\n")
+
+
+def clean_corrupted_files() -> int:
+    """扫描下载文件夹，删除文件头是 HTML 的损坏文件，返回删除数量"""
+    if not DOWNLOAD_DIR.exists():
+        return 0
+    deleted = 0
+    book_exts = {".pdf", ".epub", ".mobi", ".djvu", ".azw3", ".fb2"}
+    for f in DOWNLOAD_DIR.iterdir():
+        if f.suffix.lower() not in book_exts:
+            continue
+        try:
+            with open(f, "rb") as fh:
+                head = fh.read(16)
+            is_html = (
+                head.startswith(b"<!") or
+                head.lower().startswith(b"<html") or
+                head.startswith(b"\r\n<!") or
+                head.startswith(b"\n<!") or
+                b"<html" in head
+            )
+            # PDF / EPUB(PK) / MOBI / DJVU
+            is_valid = (
+                head[:4] == b"%PDF" or
+                head[:2] == b"PK" or
+                b"BOOKMOBI" in head or
+                head[:4] == b"AT&T" or
+                head[:4] == b"\xd0\xcf\x11\xe0"
+            )
+            if is_html or (not is_valid and f.stat().st_size < 200 * 1024):
+                f.unlink()
+                deleted += 1
+        except Exception:
+            pass
+    return deleted
 
 
 # ── 单本处理 ──────────────────────────────────────────────────────────────────
@@ -231,6 +311,17 @@ def main():
         return
 
     DOWNLOAD_DIR.mkdir(exist_ok=True)
+
+    # 清理上次下载的损坏文件（HTML 网页被误存为 PDF/EPUB）
+    cleaned = clean_corrupted_files()
+    if cleaned:
+        print(f"🗑  已自动删除 {cleaned} 个损坏文件（HTML 网页），将重新下载")
+        # 同时清除 downloaded.txt 里对应的记录，让这些书重新排队
+        # （因为我们不知道哪些序号对应损坏文件，全部重置更安全）
+        if Path(DONE_FILE).exists():
+            Path(DONE_FILE).unlink()
+        print("   downloaded.txt 已重置，全部重新下载")
+
     books = load_books()
     done  = load_done()
 
