@@ -130,23 +130,34 @@ async def _first_result(page):
 
 
 async def _download_link(page, fallback: str) -> str:
-    """从详情页提取最优下载链接"""
+    """从详情页提取最优下载链接，返回 detail 页 URL 作为兜底"""
+    # 先滚动确保页面内容加载
+    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    await asyncio.sleep(0.8)
+
+    # 明确的镜像 / 慢速下载链接（排除账户页等干扰）
     patterns = [
-        "a[href*='/fast_download/']",
-        "a[href*='libgen.']",
+        "a[href*='/slow_download/']",
+        "a[href*='libgen.rs']",
+        "a[href*='libgen.is']",
         "a[href*='library.lol']",
         "a[href*='b-ok.']",
         "a[href*='z-lib.']",
-        "a[href*='download']",
-        "a.js-download-link",
+        "a[href*='books.ms']",
+        "a[href*='ipfs']",
     ]
     for pat in patterns:
         els = await page.query_selector_all(pat)
-        if els:
-            href = await els[0].get_attribute("href") or ""
+        for el in els:
+            href = await el.get_attribute("href") or ""
+            # 跳过账户/导航类链接
+            if any(skip in href for skip in ["/account/", "/search", "#", "javascript:"]):
+                continue
             if href:
                 return BASE_URL + href if href.startswith("/") else href
-    return fallback      # 返回详情页链接作为兜底
+
+    # 兜底：返回详情页本身（/md5/ URL），供下载脚本处理
+    return fallback
 
 
 # ── CSV / Excel 辅助 ──────────────────────────────────────────────────────────
