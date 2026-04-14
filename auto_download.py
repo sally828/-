@@ -28,6 +28,7 @@ DOWNLOAD_DIR = _HERE / "下载书籍"
 DONE_FILE    = _HERE / "downloaded.txt"
 
 BASE_URL     = "https://annas-archive.gl"
+PROXY        = "http://127.0.0.1:10808"   # V2RayN 默认端口，改成你实际用的
 DELAY_MIN    = 2.0
 DELAY_MAX    = 4.0
 
