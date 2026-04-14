@@ -88,16 +88,34 @@ async def try_download(page, context, book_url: str, title: str) -> bool:
 
         # ── 调试：收集页面上所有链接，找下载相关的 ──────────────────────
         all_links = await page.query_selector_all("a[href]")
+
+        # 先滚动到底部，确保懒加载内容也出现
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await asyncio.sleep(1)
+
         download_candidates = []
         for link in all_links:
             href = await link.get_attribute("href") or ""
             text = (await link.inner_text()).strip()[:30]
-            # 收集所有看起来像下载链接的
+
+            # 排除：账户页、锚点、空链接、站内导航
+            if any(skip in href for skip in [
+                "/account/", "#", "javascript:", "/search", "/home",
+                "/faq", "/donate", "/db/", "/datasets", "/blog",
+                "/member", "/login", "/signup",
+            ]):
+                continue
+
+            # 保留：明确的下载或镜像链接
             if any(kw in href for kw in [
-                "slow_download", "fast_download", "download",
+                "slow_download", "fast_download",
                 "libgen", "library.lol", "b-ok", "zlibrary",
                 "z-lib", "1lib", "books.ms", "ipfs",
-            ]):
+                "sci-hub", "bookfi", "bookzz",
+            ]) or (
+                # 或者是带文件扩展名的直链
+                re.search(r'\.(pdf|epub|mobi|djvu|fb2|azw3)(\?|$)', href, re.I)
+            ):
                 download_candidates.append((href, text))
 
         if download_candidates:
