@@ -81,7 +81,17 @@ async def main():
         page = await ctx.new_page()
         page.on("response", on_response)
 
-        print(f"\n正在打开 IMA 知识库…")
+        print(f"\n正在打开 IMA 登录页，请在浏览器里登录腾讯账号…")
+        await page.goto("https://ima.qq.com", wait_until="domcontentloaded", timeout=40000)
+
+        print()
+        print("=" * 58)
+        print(" 第一步：请在打开的浏览器窗口里登录")
+        print(" 登录完成后，回到这里按 Enter")
+        print("=" * 58)
+        input(">>> 登录完成后按 Enter：")
+
+        print(f"\n正在跳转到书单页面…")
         await page.goto(IMA_URL, wait_until="domcontentloaded", timeout=40000)
         await asyncio.sleep(3)
 
