@@ -57,13 +57,17 @@ def _do_download(cdn_url: str, save_dir: Path, base_name: str, proxies) -> Path:
     r.raise_for_status()
     ct  = r.headers.get("content-type", "").lower()
     ext = next((t for t in FILE_TYPES if t in ct or cdn_url.lower().endswith(f".{t}")), "pdf")
-    sp  = save_dir / f"{base_name}.{ext}"
+    sp   = save_dir / f"{base_name}.{ext}"
     size = 0
-    with open(sp, "wb") as f:
-        for chunk in r.iter_content(chunk_size=65536):
-            if chunk:
-                f.write(chunk)
-                size += len(chunk)
+    try:
+        with open(sp, "wb") as f:
+            for chunk in r.iter_content(chunk_size=65536):
+                if chunk:
+                    f.write(chunk)
+                    size += len(chunk)
+    except Exception:
+        sp.unlink(missing_ok=True)   # 下载中断时清理残缺文件
+        raise
     if size < 10_000:
         sp.unlink(missing_ok=True)
         raise ValueError(f"文件太小（{size} 字节）")
@@ -107,12 +111,16 @@ async def download_book(page, book: dict) -> bool:
     for _ in range(12):
         await asyncio.sleep(1)
         current = page.url
-        if current and "annas-archive" not in current and current != url:
+        # 排除 chrome-error:// 等非 http 地址（CDN 无法访问时浏览器跳到内部错误页）
+        if (current
+                and current.startswith("http")
+                and "annas-archive" not in current
+                and current != url):
             cdn_url = current
             break
 
-    if "annas-archive" in cdn_url or cdn_url == url:
-        print(f"    ❌ 未能跳转到下载地址")
+    if not cdn_url.startswith("http") or "annas-archive" in cdn_url or cdn_url == url:
+        print(f"    ❌ 未能跳转到下载地址（CDN 不可达或代理断线）")
         return False
 
     # ── 第三步：requests 在线程里直接下载到磁盘 ──
