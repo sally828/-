@@ -81,11 +81,11 @@ def main():
         writer.writeheader()
         writer.writerows(books)
 
-    not_found = sum(1 for b in books if "未找到" in b.get("状态", ""))
-    already   = sum(1 for b in books if "找到"  in b.get("状态", "") and "未" not in b.get("状态", ""))
+    already   = sum(1 for b in books if "找到" in b.get("状态", "") and "未" not in b.get("状态", ""))
+    pending   = len(books) - already
 
     print(f"✅ 已生成 {OUTPUT_CSV}")
-    print(f"   总计：{len(books)} 条 | 已找到：{already} 条 | 待搜索：{not_found} 条")
+    print(f"   总计：{len(books)} 条 | 已找到：{already} 条 | 待搜索：{pending} 条")
     if skipped:
         print(f"   跳过无法解析的行：{skipped} 行")
 

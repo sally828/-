@@ -44,6 +44,18 @@
   下载链接列：点击"点击下载"即可跳转到下载页面
 
 
+【可选第五步：将搜索结果写回书目 CSV】
+---------------------------------------------------
+搜索完成后，运行以下命令把搜索状态更新回 books_input.csv：
+
+    python update_catalog.py
+
+  - 自动读取 search_progress.csv，将「状态」和「找到书名」写回 books_input.csv
+  - 覆盖前会自动备份原文件为 books_input.csv.bak
+  - 更新后，下次在新机器上运行 search_anna.py 无需保留进度文件
+  - 已标记"OK 找到"的书不会被覆盖
+
+
 【常见问题】
 ---------------------------------------------------
 Q: 运行时弹出 Cloudflare 验证怎么办？
@@ -63,6 +75,7 @@ A: 在 books_input.csv 里删掉不需要的行，再运行脚本。
 文件清单：
   search_anna.py      主搜索脚本
   convert_to_csv.py   文本转 CSV 工具
+  update_catalog.py   将搜索结果写回书目 CSV
   books_input.csv     输入书单（需要你准备）
   books_raw.txt       原始文本书单（如果用方法B）
   search_progress.csv 断点续传记录（自动生成）

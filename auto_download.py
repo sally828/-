@@ -1,59 +1,78 @@
 #!/usr/bin/env python3
 """
-Anna's Archive 自动下载脚本 v6
-- 如果 Excel 里有正确的 /md5/ 链接 → 直接 Fast Download
-- 如果链接无效（/account/downloaded 等）→ 自动用「找到书名」重新搜索取 MD5，再 Fast Download
-
-使用方法：
-  1. 运行脚本，浏览器会自动打开
-  2. 在浏览器里登录 Anna's Archive 账号（只需一次）
-  3. 回到命令行按 Enter，开始全自动下载
-
-运行：python auto_download.py
+Anna's Archive 自动下载脚本（Playwright 版）
+- 浏览器打开后你手动登录一次，后续全自动
+- 运行：python auto_download.py
 """
 
 import asyncio
 import random
 import re
 from pathlib import Path
-from urllib.parse import quote
 
 import openpyxl
+import requests as _req
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
-# ── 配置 ──────────────────────────────────────────────────────────────────────
-PROXY        = "http://127.0.0.1:10808"
-EXCEL_FILE   = "书目搜索结果.xlsx"
-DOWNLOAD_DIR = Path("下载书籍")
-DONE_FILE    = "downloaded.txt"
+# ── 配置 ──────────────────────────────────────────────
+PROXY        = "http://127.0.0.1:10808"   # TUN全局模式改成 None
 HEADLESS     = False
 DELAY_MIN    = 1.5
 DELAY_MAX    = 3.0
 BASE_URL     = "https://annas-archive.gl"
-# ─────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────
 
-INVALID_PATTERNS = ["/account/", "javascript:", "#", "/donate",
-                    "/faq", "/blog", "/search", "/datasets"]
+_HERE        = Path(__file__).parent
+EXCEL_FILE   = _HERE / "书目搜索结果.xlsx"
+DOWNLOAD_DIR = _HERE / "下载书籍"
+DONE_FILE    = _HERE / "downloaded.txt"
 
+# 需要拦截的书籍文件类型
+FILE_TYPES = ["pdf", "epub", "mobi", "djvu", "azw3", "azw", "fb2", "cbz", "cbr"]
 
-# ── 工具函数 ──────────────────────────────────────────────────────────────────
 
 def extract_md5(url: str) -> str | None:
-    m = re.search(r'/md5/([a-f0-9]{32})', url, re.I)
-    return m.group(1).lower() if m else None
-
+    m = re.search(r'[a-f0-9]{32}', str(url or ""), re.I)
+    return m.group(0).lower() if m else None
 
 def safe_name(name: str) -> str:
     return re.sub(r'[\\/:*?"<>|]', '_', name)[:80].strip()
 
+def load_done() -> set:
+    return set(DONE_FILE.read_text(encoding="utf-8").splitlines()) if DONE_FILE.exists() else set()
 
-def is_invalid_url(url: str) -> bool:
-    if not url or not url.startswith("http"):
-        return True
-    return any(p in url for p in INVALID_PATTERNS)
+def mark_done(num: str):
+    with open(DONE_FILE, "a", encoding="utf-8") as f:
+        f.write(num + "\n")
 
+def _do_download(cdn_url: str, save_dir: Path, base_name: str, proxies) -> Path:
+    """同步下载函数，在线程中运行，字节直接写盘，不经过 Playwright IPC"""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+        )
+    }
+    r = _req.get(cdn_url, headers=headers, proxies=proxies, timeout=120, stream=True)
+    r.raise_for_status()
+    ct  = r.headers.get("content-type", "").lower()
+    ext = next((t for t in FILE_TYPES if t in ct or cdn_url.lower().endswith(f".{t}")), "pdf")
+    sp   = save_dir / f"{base_name}.{ext}"
+    size = 0
+    try:
+        with open(sp, "wb") as f:
+            for chunk in r.iter_content(chunk_size=65536):
+                if chunk:
+                    f.write(chunk)
+                    size += len(chunk)
+    except Exception:
+        sp.unlink(missing_ok=True)   # 下载中断时清理残缺文件
+        raise
+    if size < 10_000:
+        sp.unlink(missing_ok=True)
+        raise ValueError(f"文件太小（{size} 字节）")
+    return sp
 
-# ── Excel 读取 ────────────────────────────────────────────────────────────────
 
 def load_books() -> list[dict]:
     wb = openpyxl.load_workbook(EXCEL_FILE)
@@ -65,214 +84,81 @@ def load_books() -> list[dict]:
         for i, cell in enumerate(row):
             if i < len(headers) and headers[i]:
                 data[headers[i]] = cell.hyperlink.target if cell.hyperlink else cell.value
-        num        = str(data.get("序号", "") or "").strip()
-        found_name = str(data.get("找到书名", "") or "").strip()
-        orig_name  = str(data.get("原书名", "") or "").strip()
-        url        = str(data.get("下载链接", "") or "").strip()
+        num  = str(data.get("序号", "") or "").strip()
+        name = str(data.get("找到书名", "") or data.get("原书名", "") or "").strip()
+        url  = str(data.get("下载链接", "") or "").strip()
         if num:
-            rows.append({
-                "序号":     num,
-                "书名":     found_name or orig_name or f"书_{num}",
-                "找到书名": found_name,
-                "原书名":   orig_name,
-                "url":      url,
-            })
+            rows.append({"序号": num, "书名": name or f"书_{num}", "url": url})
     return rows
 
 
-def load_done() -> set:
-    if Path(DONE_FILE).exists():
-        return set(Path(DONE_FILE).read_text(encoding="utf-8").splitlines())
-    return set()
+async def download_book(page, book: dict) -> bool:
+    url   = book["url"]
+    title = book["书名"]
 
+    if not url.startswith("http"):
+        print(f"    ⚠ 无链接，跳过")
+        return False
 
-def mark_done(num: str):
-    with open(DONE_FILE, "a", encoding="utf-8") as f:
-        f.write(num + "\n")
-
-
-# ── 搜索取 MD5 ────────────────────────────────────────────────────────────────
-
-async def search_for_md5(page, title: str) -> str | None:
-    """
-    在 Anna's Archive 搜索书名，返回第一个结果的 MD5；找不到返回 None
-    """
-    query = title.strip()
-    if not query:
-        return None
-
-    for lang in ["&lang=zh&sort=", ""]:
-        try:
-            url = f"{BASE_URL}/search?q={quote(query)}{lang}"
-            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(random.uniform(0.8, 1.5))
-
-            # 找第一条 /md5/ 结果
-            for sel in ["a.js-vim-focus", "div.mb-4 a[href^='/md5/']", "a[href^='/md5/']"]:
-                items = await page.query_selector_all(sel)
-                for item in items:
-                    href = await item.get_attribute("href") or ""
-                    md5 = extract_md5(href)
-                    if md5:
-                        return md5
-        except Exception:
-            continue
-    return None
-
-
-# ── 下载逻辑 ─────────────────────────────────────────────────────────────────
-
-async def fast_download(page, md5: str, title: str) -> Path | None:
-    """进入 /md5/ 详情页，点 Fast Download 按钮"""
+    # ── 第一步：导航到 fast_download URL，让浏览器跟随跳转到 CDN ──
     try:
-        await page.goto(f"{BASE_URL}/md5/{md5}",
-                        wait_until="domcontentloaded", timeout=30000)
-        await asyncio.sleep(1.5)
-    except PlaywrightTimeout:
-        return None
+        await page.goto(url, wait_until="commit", timeout=30000)
+    except Exception:
+        pass
 
-    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-    await asyncio.sleep(0.8)
+    # ── 第二步：等待浏览器地址栏变成 CDN 地址（最多 12 秒）──
+    cdn_url = url
+    for _ in range(12):
+        await asyncio.sleep(1)
+        current = page.url
+        # 排除 chrome-error:// 等非 http 地址（CDN 无法访问时浏览器跳到内部错误页）
+        if (current
+                and current.startswith("http")
+                and "annas-archive" not in current
+                and current != url):
+            cdn_url = current
+            break
 
-    for sel in [
-        "a[href*='/fast_download/']",
-        "a:text-matches('fast download', 'i')",
-        "a[href*='fast_download']",
-    ]:
-        try:
-            btn = await page.query_selector(sel)
-            if not btn:
-                continue
-            href = await btn.get_attribute("href") or ""
-            if any(p in href for p in INVALID_PATTERNS):
-                continue
-            try:
-                async with page.expect_download(timeout=30000) as dl_info:
-                    await btn.click()
-                dl = await dl_info.value
-                fname = dl.suggested_filename
-                ext   = fname.rsplit(".", 1)[-1] if "." in fname else "pdf"
-                save_path = DOWNLOAD_DIR / f"{safe_name(title)}.{ext}"
-                await dl.save_as(save_path)
+    if not cdn_url.startswith("http") or "annas-archive" in cdn_url or cdn_url == url:
+        print(f"    ❌ 未能跳转到下载地址（CDN 不可达或代理断线）")
+        return False
 
-                size_mb = save_path.stat().st_size / 1024 / 1024
-                if size_mb < 0.05:
-                    save_path.unlink(missing_ok=True)
-                    return None
-                print(f"    ✅ {save_path.name}  ({size_mb:.1f} MB)")
-                return save_path
-            except Exception:
-                continue
-        except Exception:
-            continue
-    return None
-
-
-async def slow_download(page, md5: str, title: str) -> Path | None:
-    """备用：/slow_download/ 页面（无需会员）"""
+    # ── 第三步：requests 在线程里直接下载到磁盘 ──
+    # 不走 Playwright IPC——大文件（100MB+）会撑爆 IPC Socket
+    proxies = {"http": PROXY, "https": PROXY} if PROXY else None
     try:
-        await page.goto(f"{BASE_URL}/slow_download/{md5}",
-                        wait_until="domcontentloaded", timeout=30000)
-        await asyncio.sleep(2)
-    except PlaywrightTimeout:
-        return None
-
-    for sel in ["a[href*='slow_download']", "a:text-matches('download', 'i')"]:
-        try:
-            btn = await page.query_selector(sel)
-            if not btn:
-                continue
-            href = await btn.get_attribute("href") or ""
-            if any(p in href for p in INVALID_PATTERNS):
-                continue
-            try:
-                async with page.expect_download(timeout=300000) as dl_info:
-                    await btn.click()
-                dl = await dl_info.value
-                fname = dl.suggested_filename
-                ext   = fname.rsplit(".", 1)[-1] if "." in fname else "pdf"
-                save_path = DOWNLOAD_DIR / f"{safe_name(title)}.{ext}"
-                await dl.save_as(save_path)
-
-                size_mb = save_path.stat().st_size / 1024 / 1024
-                if size_mb < 0.05:
-                    save_path.unlink(missing_ok=True)
-                    return None
-                print(f"    ✅ (慢速) {save_path.name}  ({size_mb:.1f} MB)")
-                return save_path
-            except Exception:
-                continue
-        except Exception:
-            continue
-    return None
-
-
-# ── 处理单本书 ────────────────────────────────────────────────────────────────
-
-async def process_book(page, book: dict) -> bool:
-    url        = book["url"]
-    title      = book["书名"]
-    found_name = book["找到书名"]
-
-    # Step 1：从 URL 里取 MD5
-    md5 = extract_md5(url)
-
-    # Step 2：URL 无效 → 用「找到书名」搜索取 MD5
-    if not md5:
-        if not found_name:
-            print(f"    ⚠ 链接无效且无搜索结果记录，跳过")
-            return False
-        print(f"    → 链接无效，重新搜索「{found_name[:40]}」…")
-        md5 = await search_for_md5(page, found_name)
-        if not md5:
-            print(f"    ❌ 搜索未找到")
-            return False
-        print(f"    → 找到 md5={md5[:8]}…")
-
-    # Step 3：Fast Download
-    result = await fast_download(page, md5, title)
-    if result:
+        sp = await asyncio.to_thread(
+            _do_download, cdn_url, DOWNLOAD_DIR, safe_name(title), proxies
+        )
+        size_mb = sp.stat().st_size / 1024 / 1024
+        print(f"    ✅ {sp.name}  ({size_mb:.1f} MB)")
         return True
+    except Exception as e:
+        print(f"    ❌ {e}")
+        return False
 
-    # Step 4：备用慢速下载
-    print(f"    → Fast Download 未触发，尝试慢速…")
-    result = await slow_download(page, md5, title)
-    return result is not None
-
-
-# ── 主流程 ────────────────────────────────────────────────────────────────────
 
 async def main():
     DOWNLOAD_DIR.mkdir(exist_ok=True)
-    books = load_books()
-    done  = load_done()
+    books   = load_books()
+    done    = load_done()
+    pending = [b for b in books if b["序号"] not in done and extract_md5(b["url"])]
 
-    pending = [b for b in books if b["序号"] not in done]
-    # 只处理有找到书名或有效 URL 的条目（纯未找到的跳过）
-    pending = [b for b in pending if b["找到书名"] or not is_invalid_url(b["url"])]
-
-    direct  = sum(1 for b in pending if extract_md5(b["url"]))
-    need_search = len(pending) - direct
-
-    print(f"📚 共 {len(books)} 条 | 已完成 {len(done)} | 待处理 {len(pending)}")
-    print(f"   其中：直接有 MD5 = {direct} 条 | 需重新搜索 = {need_search} 条")
-    print(f"📁 保存到: {DOWNLOAD_DIR.absolute()}\n")
-
+    print(f"📚 共 {len(books)} 条 | 已完成 {len(done)} | 本次下载 {len(pending)} 条")
+    print(f"📁 保存到: {DOWNLOAD_DIR}\n")
     if not pending:
         print("✅ 全部完成！")
         return
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=HEADLESS,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                f"--proxy-server={PROXY}",
-                "--disable-pdf-viewer",          # 强制 PDF 触发下载而非在浏览器内打开
-                "--disable-plugins",
-            ],
-        )
+        args = [
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+        ]
+        if PROXY:
+            args.append(f"--proxy-server={PROXY}")
+
+        browser = await pw.chromium.launch(headless=HEADLESS, args=args)
         ctx = await browser.new_context(
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -285,34 +171,24 @@ async def main():
         )
         page = await ctx.new_page()
 
-        # ── 登录 ─────────────────────────────────────────────────────
         print("🌐 正在打开 Anna's Archive…")
-        try:
-            await page.goto(f"{BASE_URL}/account",
-                            wait_until="domcontentloaded", timeout=40000)
-        except Exception:
-            await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=40000)
-
-        print()
-        print("=" * 60)
-        print("请在浏览器窗口里登录你的 Anna's Archive 账号")
-        print("登录完成后，回到这里按 Enter 开始下载")
-        print("=" * 60)
-        input(">>> 登录完成，按 Enter 继续：")
+        await page.goto(f"{BASE_URL}/account", wait_until="domcontentloaded", timeout=40000)
+        print("\n" + "=" * 55)
+        print("请在浏览器里登录你的 Anna's Archive 账号")
+        print("登录完成后回到这里按 Enter")
+        print("=" * 55)
+        input(">>> 登录完成，按 Enter 开始下载：")
         print()
 
         success = fail = 0
         for i, book in enumerate(pending):
-            num, title = book["序号"], book["书名"]
-            print(f"[{i+1:4d}/{len(pending)}] #{num}  {title[:50]}")
-
-            ok = await process_book(page, book)
+            print(f"[{i+1:4d}/{len(pending)}] #{book['序号']}  {book['书名'][:50]}")
+            ok = await download_book(page, book)
             if ok:
                 success += 1
-                mark_done(num)
+                mark_done(book["序号"])
             else:
                 fail += 1
-
             await asyncio.sleep(random.uniform(DELAY_MIN, DELAY_MAX))
 
         await browser.close()
