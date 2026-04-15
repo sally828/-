@@ -11,6 +11,7 @@ import re
 from pathlib import Path
 
 import openpyxl
+import requests as _req
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
 # ── 配置 ──────────────────────────────────────────────
@@ -43,6 +44,31 @@ def load_done() -> set:
 def mark_done(num: str):
     with open(DONE_FILE, "a", encoding="utf-8") as f:
         f.write(num + "\n")
+
+def _do_download(cdn_url: str, save_dir: Path, base_name: str, proxies) -> Path:
+    """同步下载函数，在线程中运行，字节直接写盘，不经过 Playwright IPC"""
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
+        )
+    }
+    r = _req.get(cdn_url, headers=headers, proxies=proxies, timeout=120, stream=True)
+    r.raise_for_status()
+    ct  = r.headers.get("content-type", "").lower()
+    ext = next((t for t in FILE_TYPES if t in ct or cdn_url.lower().endswith(f".{t}")), "pdf")
+    sp  = save_dir / f"{base_name}.{ext}"
+    size = 0
+    with open(sp, "wb") as f:
+        for chunk in r.iter_content(chunk_size=65536):
+            if chunk:
+                f.write(chunk)
+                size += len(chunk)
+    if size < 10_000:
+        sp.unlink(missing_ok=True)
+        raise ValueError(f"文件太小（{size} 字节）")
+    return sp
+
 
 def load_books() -> list[dict]:
     wb = openpyxl.load_workbook(EXCEL_FILE)
@@ -89,27 +115,14 @@ async def download_book(page, book: dict) -> bool:
         print(f"    ❌ 未能跳转到下载地址")
         return False
 
-    # ── 第三步：用浏览器 Session 直接下载文件字节 ──
-    # page.context.request 和浏览器共享 Cookie，不需要额外认证
+    # ── 第三步：requests 在线程里直接下载到磁盘 ──
+    # 不走 Playwright IPC——大文件（100MB+）会撑爆 IPC Socket
+    proxies = {"http": PROXY, "https": PROXY} if PROXY else None
     try:
-        resp = await page.context.request.get(cdn_url, timeout=90000)
-        body = await resp.body()
-        ct   = resp.headers.get("content-type", "").lower()
-
-        if not resp.ok:
-            print(f"    ❌ HTTP {resp.status}")
-            return False
-        if len(body) < 10_000:
-            print(f"    ❌ 文件太小（{len(body)} 字节）")
-            return False
-
-        ext = next(
-            (t for t in FILE_TYPES if t in ct or cdn_url.lower().endswith(f".{t}")),
-            "pdf"
+        sp = await asyncio.to_thread(
+            _do_download, cdn_url, DOWNLOAD_DIR, safe_name(title), proxies
         )
-        sp = DOWNLOAD_DIR / f"{safe_name(title)}.{ext}"
-        sp.write_bytes(body)
-        size_mb = len(body) / 1024 / 1024
+        size_mb = sp.stat().st_size / 1024 / 1024
         print(f"    ✅ {sp.name}  ({size_mb:.1f} MB)")
         return True
     except Exception as e:
