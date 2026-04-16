@@ -47,7 +47,7 @@ async def call_api(page, folder_id: str, cursor: str = "", count: int = 50) -> d
                         share_id: args.shareId,
                         folder_id: args.folderId,
                         cursor: args.cursor,
-                        count: args.count
+                        limit: args.count
                     })
                 });
                 return await resp.json();
