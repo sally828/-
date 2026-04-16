@@ -64,24 +64,26 @@ async def probe_folder_param(page, folder_id: str) -> str | None:
     探测调用 MEMBER_API 进入子文件夹时正确的参数字段名。
     返回有效的字段名（如 'folder_id'），或 None。
     """
+    # 每种参数名都分别试 有/无 limit
     candidates = [
-        "folder_id",
-        "kb_id",
-        "knowledge_id",
-        "knowledge_base_id",
-        "node_id",
-        "parent_id",
-        "id",
+        ("folder_id",          {"folder_id": folder_id,          "cursor": "", "limit": 20}),
+        ("folder_id-nolimit",  {"folder_id": folder_id,          "cursor": ""}),
+        ("kb_id",              {"kb_id": folder_id,              "cursor": "", "limit": 20}),
+        ("knowledge_id",       {"knowledge_id": folder_id,       "cursor": "", "limit": 20}),
+        ("knowledge_base_id",  {"knowledge_base_id": folder_id,  "cursor": "", "limit": 20}),
+        ("node_id",            {"node_id": folder_id,            "cursor": "", "limit": 20}),
+        ("parent_id",          {"parent_id": folder_id,          "cursor": "", "limit": 20}),
+        ("id",                 {"id": folder_id,                 "cursor": "", "limit": 20}),
     ]
-    for param in candidates:
-        body = {param: folder_id, "cursor": ""}
+    for label, body in candidates:
         result = await js_post(page, MEMBER_API, body)
         code  = result.get("code", -1)
         items = result.get("knowledge_list", [])
-        print(f"  {param}={folder_id}: code={code}, items={len(items)}")
+        print(f"  [{label}] code={code}, items={len(items)}")
         if code == 0 and items:
-            print(f"  ✅ 有效参数名：{param}")
-            return param
+            param_name = label.split("-")[0]   # strip "-nolimit" suffix
+            print(f"  ✅ 有效格式：{body}")
+            return param_name
         await asyncio.sleep(0.3)
     return None
 
@@ -253,6 +255,19 @@ async def main():
             encoding="utf-8"
         )
         print(f"共拦截到 {len(api_responses)} 个 API 响应")
+
+        # ── 打印所有含非空列表的响应（不限于 knowledge_list）──────────────────
+        print("\n含列表数据的响应：")
+        for r in api_responses:
+            b = r["body"]
+            if not isinstance(b, dict) or b.get("code") != 0:
+                continue
+            for key, val in b.items():
+                if isinstance(val, list) and len(val) > 0 and key != "current_path":
+                    first = val[0]
+                    preview = json.dumps(first, ensure_ascii=False)[:80] if isinstance(first, dict) else str(first)[:80]
+                    print(f"  {r['url'].split('/')[-1]:40s} .{key}={len(val)}项  first={preview}")
+                    break
 
         # ── 找 KB 标签页（wikis URL）────────────────────────────────────────
         kb_page = page
