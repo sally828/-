@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 腾讯 IMA 知识库书单提取脚本
-路径：ima.qq.com 主页（已登录）→ 点「个人知识库」→ 点「追梦人的财经图书馆」
-拦截成员视角 API，递归提取完整书单（含分类层级）
+路径：ima.qq.com 主页（已登录）→ 个人知识库 → 共享知识库 → 追梦人的财经图书馆
+拦截成员视角 API，递归提取完整书单
 """
 
 import asyncio
@@ -31,6 +31,12 @@ def clean(text: str) -> str:
 def is_book_name(name: str) -> bool:
     name = name.strip()
     return len(name) >= 3 and not name.startswith("http")
+
+
+async def async_input(prompt: str) -> str:
+    """非阻塞 input —— 不锁死 asyncio 事件循环，拦截器可以继续运行"""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, input, prompt)
 
 
 async def call_api(page, url: str, body: dict) -> dict:
@@ -83,7 +89,7 @@ async def fetch_folder(page, api_url: str, base_body: dict,
     return books
 
 
-async def try_click(page, selectors: list, timeout_ms: int = 4000) -> bool:
+async def try_click(page, selectors: list, timeout_ms: int = 3000) -> bool:
     for sel in selectors:
         try:
             loc = page.locator(sel).first
@@ -100,9 +106,8 @@ async def main():
     if PROXY:
         browser_args.append(f"--proxy-server={PROXY}")
 
-    # 同时记录请求体和响应体，方便匹配
-    req_bodies    = {}   # url -> latest POST body
-    api_responses = []   # list of {url, req_body, body}
+    req_bodies    = {}
+    api_responses = []
 
     async def on_request(request):
         if "ima.qq.com/cgi-bin" not in request.url:
@@ -117,7 +122,8 @@ async def main():
         if "ima.qq.com" not in response.url:
             return
         try:
-            if "json" not in response.headers.get("content-type", ""):
+            ct = response.headers.get("content-type", "")
+            if "json" not in ct:
                 return
             resp_body = await response.json()
             api_responses.append({
@@ -133,14 +139,11 @@ async def main():
         try:
             browser = await pw.chromium.connect_over_cdp(CDP_URL)
             ctx  = browser.contexts[0] if browser.contexts else None
-            # 优先选择在 ima.qq.com 主界面的页（跳过分享/公共页）
             page = None
             if ctx:
                 for p in ctx.pages:
                     u = p.url
-                    if ("ima.qq.com" in u
-                            and "/wiki/" not in u
-                            and "ima.copilot" not in u):
+                    if "ima.qq.com" in u and "/wiki/" not in u and "ima.copilot" not in u:
                         page = p
                         break
                 if page is None:
@@ -160,64 +163,73 @@ async def main():
         if not using_cdp:
             await page.goto("https://ima.qq.com", wait_until="domcontentloaded", timeout=40000)
             print("请登录腾讯账号后按 Enter")
-            input(">>> ")
+            await async_input(">>> ")
 
-        # 注册拦截器
+        # 注册拦截器（必须在导航前注册）
         page.on("request",  on_request)
         page.on("response", on_response)
 
-        # 确保在 ima.qq.com 主页（不是分享/公共页）
-        cur_url = page.url
-        if (not cur_url.startswith("https://ima.qq.com")
-                or "/wiki/" in cur_url
-                or "ima.copilot" in cur_url):
-            print("正在导航到 IMA 主页…")
-            await page.goto("https://ima.qq.com", wait_until="domcontentloaded", timeout=40000)
-            await asyncio.sleep(2)
+        # 导航到 ima.qq.com 主页（清空历史导航，确保从头开始点击）
+        print("\n正在导航到 IMA 主页…")
+        await page.goto("https://ima.qq.com", wait_until="domcontentloaded", timeout=40000)
+        await asyncio.sleep(3)
         print(f"当前页面：{page.url}")
 
-        # ── 步骤1：点击「个人知识库」展开 ───────────────────────────────────────
+        # ── 步骤1：点击「个人知识库」展开 ────────────────────────────────────
         print("\n步骤1：展开「个人知识库」…")
         ok = await try_click(page, [
             ':text-is("个人知识库")',
             'text="个人知识库"',
             ':text("个人知识库")',
-            'span:has-text("个人知识库"):not(:has(span))',
-            'div:has-text("个人知识库"):not(:has(div))',
         ])
-        print(f"  {'✅ 已点击' if ok else '（可能已展开，继续）'}")
-        await asyncio.sleep(1.5)
+        print(f"  {'✅ 已点击' if ok else '（可能已展开）'}")
+        await asyncio.sleep(3)   # 等待侧栏展开（React re-render 需要时间）
 
-        # ── 步骤2：点击「追梦人的财经图书馆」 ──────────────────────────────────
-        print(f"\n步骤2：点击「{KB_NAME}」…")
-        ok = await try_click(page, [
+        # ── 步骤2（可选）：点击「共享知识库」展开（如果需要）─────────────────
+        print("\n步骤2：展开「共享知识库」（如有）…")
+        ok2 = await try_click(page, [
+            ':text-is("共享知识库")',
+            'text="共享知识库"',
+            ':text("共享知识库")',
+        ], timeout_ms=2000)
+        if ok2:
+            print("  ✅ 已点击「共享知识库」")
+            await asyncio.sleep(2)
+        else:
+            print("  （无需点击或已展开）")
+
+        # ── 步骤3：点击「追梦人的财经图书馆」────────────────────────────────
+        print(f"\n步骤3：点击「{KB_NAME}」…")
+        ok3 = await try_click(page, [
             f':text-is("{KB_NAME}")',
             f'text="{KB_NAME}"',
             f':text("{KB_NAME}")',
             f'[title="{KB_NAME}"]',
             f'span:has-text("{KB_NAME}")',
             f'a:has-text("{KB_NAME}")',
-            f'div:has-text("{KB_NAME}"):not(:has(div:has-text("{KB_NAME}")))',
-        ], timeout_ms=6000)
+        ], timeout_ms=5000)
 
-        if ok:
-            print(f"  ✅ 已点击")
+        if ok3:
+            print(f"  ✅ 已自动点击")
+            print("  等待 API 响应（10秒）…")
+            await asyncio.sleep(10)
         else:
-            print(f"  未能自动点击，请在 360 浏览器里手动点击左侧「{KB_NAME}」")
+            print(f"  ⚠ 未能自动点击。")
+            print(f"  请在 360 浏览器里手动点击左侧「{KB_NAME}」")
             print(f"  路径：个人知识库 → 共享知识库 → {KB_NAME}")
-            input("  点好后按 Enter 继续 >>> ")
-
-        print("\n等待 API 响应（8秒）…")
-        await asyncio.sleep(8)
+            print(f"  点好后在这里按 Enter（在等待时 API 仍在被拦截）…")
+            await async_input("  >>> ")   # ← 非阻塞，拦截器正常运行
+            print("  再等待 5 秒让响应完整接收…")
+            await asyncio.sleep(5)
 
         # 保存所有响应供调试
         DEBUG_RESP.write_text(
             json.dumps(api_responses[:40], ensure_ascii=False, indent=2),
             encoding="utf-8"
         )
-        print(f"拦截到 {len(api_responses)} 个 API 响应")
+        print(f"\n拦截到 {len(api_responses)} 个 API 响应")
 
-        # ── 在响应中找包含知识库内容的 API ───────────────────────────────────
+        # ── 找包含知识库内容的 API（knowledge_list 非空）────────────────────
         api_url, base_body, root_id = None, {}, ""
         for r in api_responses:
             resp_body = r["body"]
@@ -226,31 +238,29 @@ async def main():
             items = resp_body.get("knowledge_list", [])
             if not items:
                 continue
-            # 找到有实际内容的接口
             api_url  = r["url"]
             req_body = r["req_body"]
             print(f"\n✅ 找到知识库 API：{api_url}")
             print(f"   请求体：{json.dumps(req_body, ensure_ascii=False)}")
             print(f"   第一条：{items[0].get('name', items[0].get('title', ''))[:60]}")
-            # 提取根 folder_id
-            path = resp_body.get("current_path", [])
+            path    = resp_body.get("current_path", [])
             root_id = path[0].get("folder_id", "") if path else ""
             if not root_id:
                 root_id = (req_body.get("folder_id")
                            or req_body.get("knowledge_base_id")
                            or "")
-            # base_body = 请求体中除 folder_id / cursor 以外的固定字段
             base_body = {k: v for k, v in req_body.items()
                          if k not in ("folder_id", "cursor")}
             break
 
         if not api_url or not root_id:
             print(f"\n⚠ 未捕获到有内容的知识库 API。")
-            print(f"   - 拦截到响应总数：{len(api_responses)}")
+            print(f"   拦截到的所有响应：")
             for r in api_responses:
                 b = r["body"]
                 if isinstance(b, dict):
-                    print(f"   {r['url'][:70]}  code={b.get('code')}  items={len(b.get('knowledge_list', []))}")
+                    print(f"   {r['url'][:80]}")
+                    print(f"     code={b.get('code')}  items={len(b.get('knowledge_list', []))}")
             print(f"\n请把 {DEBUG_RESP.name} 发给我分析。")
             if not using_cdp:
                 await browser.close()
