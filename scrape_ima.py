@@ -34,7 +34,7 @@ def is_book_name(name: str) -> bool:
     return len(name) >= 3 and not name.startswith("http")
 
 
-async def call_api(page, folder_id: str, cursor: str = "", count: int = 100) -> dict:
+async def call_api(page, folder_id: str, cursor: str = "", count: int = 50) -> dict:
     """用浏览器的登录态直接调用 IMA API"""
     return await page.evaluate("""
         async (args) => {
