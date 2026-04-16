@@ -336,14 +336,13 @@ async def main():
                 except Exception:
                     pass
 
-            # ② 否则：先回到 wikis 根，再点击文件夹名
+            # ② 否则：强制 goto 根（SPA 点击不改变 URL，必须每次都 goto 才能重置视图）
             if not navigated:
-                if kb_page.url.rstrip("/") != wikis_root_url.rstrip("/"):
-                    try:
-                        await kb_page.goto(wikis_root_url, wait_until="domcontentloaded", timeout=15000)
-                        await asyncio.sleep(2)
-                    except Exception:
-                        pass
+                try:
+                    await kb_page.goto(wikis_root_url, wait_until="domcontentloaded", timeout=15000)
+                    await asyncio.sleep(2)
+                except Exception:
+                    pass
 
                 clicked = await try_click(kb_page, [
                     f':text-is("{cat_name}")',
