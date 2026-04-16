@@ -2,9 +2,10 @@
 """
 腾讯 IMA 知识库书单提取脚本
 策略：
-  1. 监控浏览器打开追梦人KB时自动发出的 get_knowledge_list 请求，拦截22个顶层分类
-  2. 对每个分类用 knowledge_base_id 参数递归提取书目
-  注意：直接调用 {} 会返回 code=51，必须复用浏览器拦截的数据
+  1. 监控浏览器打开追梦人KB时自动发出的 get_knowledge_list，拦截22个顶层分类
+     （顶层分类 item 结构：media_type=99/文件夹，ID 在 media_id 字段）
+  2. 首次查询子文件夹时自动探测正确的参数格式，之后复用
+  3. folder 判断：media_type==99 或 media_id 以 "folder_" 开头
 """
 
 import asyncio
@@ -18,13 +19,16 @@ from playwright.async_api import async_playwright, BrowserContext
 
 # ── 配置 ──────────────────────────────────────────────────────────────────────
 KB_NAME      = "追梦人的财经图书馆"
-KB_FOLDER_ID = "7374371035301653"          # 根知识库 ID（备用）
+KB_FOLDER_ID = "7374371035301653"          # 根知识库 ID
 MEMBER_API   = "https://ima.qq.com/cgi-bin/knowledge_tab_reader/get_knowledge_list"
 PROXY        = "http://127.0.0.1:10808"
 CDP_URL      = "http://localhost:9222"
 OUTPUT_CSV   = Path(__file__).parent / "ima_booklist.csv"
 DEBUG_RESP   = Path(__file__).parent / "ima_raw.json"
 # ─────────────────────────────────────────────────────────────────────────────
+
+# 首次成功查询后缓存参数模板，"__ID__" 为 folder_id 占位符
+_FOLDER_BODY_TPL: dict | None = None
 
 
 def clean(text: str) -> str:
@@ -62,8 +66,6 @@ async def js_post(page, url: str, body: dict) -> dict:
 
 
 def register_on_page(p, api_responses: list):
-    """拦截页面上所有 ima.qq.com API 请求/响应。"""
-
     async def on_resp(response):
         if "ima.qq.com" not in response.url:
             return
@@ -71,16 +73,11 @@ def register_on_page(p, api_responses: list):
             if "json" not in response.headers.get("content-type", ""):
                 return
             rb = await response.json()
-            # 直接从 response.request 读请求体，避免竞态
             try:
                 req_body = json.loads(response.request.post_data or "{}")
             except Exception:
                 req_body = {}
-            api_responses.append({
-                "url":      response.url,
-                "req_body": req_body,
-                "body":     rb,
-            })
+            api_responses.append({"url": response.url, "req_body": req_body, "body": rb})
         except Exception:
             pass
 
@@ -100,28 +97,99 @@ async def try_click(page, selectors: list, timeout_ms: int = 3000) -> bool:
 
 
 def extract_id(item: dict) -> str:
-    """从 item 中提取知识库/文件夹 ID（尝试多个字段名）。"""
-    for field in ["knowledge_base_id", "folder_id", "id", "kb_id",
-                  "knowledge_id", "node_id"]:
+    """
+    从 item 中提取文件夹 ID。
+    IMA 文件夹的 ID 在 media_id（如 "folder_7434760334894700"）。
+    """
+    # 顶层字段：media_id 优先（实际观察到的字段）
+    for field in ["media_id", "knowledge_base_id", "folder_id",
+                  "id", "kb_id", "knowledge_id", "node_id"]:
         val = item.get(field)
         if val and isinstance(val, str) and val.strip():
             return val.strip()
         if val and isinstance(val, int) and val != 0:
             return str(val)
+    # 嵌套字段 folder_info.folder_id
+    fi = item.get("folder_info")
+    if isinstance(fi, dict):
+        val = fi.get("folder_id") or fi.get("id")
+        if val and isinstance(val, str) and val.strip():
+            return val.strip()
     return ""
 
 
-async def fetch_category(page, cat_id: str, cat_name: str, depth: int = 0) -> list:
-    """用 knowledge_base_id=cat_id 递归提取某分类下所有书目。"""
+def is_folder_item(item: dict) -> bool:
+    """判断 item 是否为文件夹（media_type=99 或 media_id 以 folder_ 开头）。"""
+    if item.get("media_type") == 99:
+        return True
+    mid = item.get("media_id", "")
+    if isinstance(mid, str) and mid.startswith("folder_"):
+        return True
+    itype = item.get("type")
+    if itype in (2, "folder", "dir", "directory"):
+        return True
+    return bool(item.get("is_folder"))
+
+
+def make_body(folder_id: str, cursor: str) -> dict:
+    body = {k: (folder_id if v == "__ID__" else v)
+            for k, v in _FOLDER_BODY_TPL.items()}
+    body["cursor"] = cursor
+    return body
+
+
+async def probe_folder_api(page, folder_id: str) -> bool:
+    """
+    探测查询文件夹内容的正确参数格式，成功后缓存到 _FOLDER_BODY_TPL。
+    尝试顺序：
+      1. {"folder_id": X}
+      2. {"knowledge_base_id": ROOT, "folder_id": X}
+      3. {"knowledge_base_id": X}
+      4. {"parent_folder_id": X}
+    """
+    global _FOLDER_BODY_TPL
+    print(f"  探测文件夹 API 参数（folder_id={folder_id}）…")
+    candidates = [
+        {"folder_id": folder_id},
+        {"knowledge_base_id": KB_FOLDER_ID, "folder_id": folder_id},
+        {"knowledge_base_id": folder_id},
+        {"parent_folder_id": folder_id},
+    ]
+    for probe in candidates:
+        body = dict(probe)
+        body["cursor"] = ""
+        d    = await js_post(page, MEMBER_API, body)
+        code = d.get("code", -1)
+        kl   = d.get("knowledge_list", [])
+        print(f"    {body} → code={code}, items={len(kl)}")
+        if code == 0:
+            tpl = {k: ("__ID__" if v == folder_id else v) for k, v in probe.items()}
+            _FOLDER_BODY_TPL = tpl
+            print(f"  ✅ 参数模板：{tpl}")
+            return True
+        await asyncio.sleep(0.3)
+    return False
+
+
+async def fetch_category(page, folder_id: str, cat_name: str, depth: int = 0) -> list:
+    global _FOLDER_BODY_TPL
+
     books    = []
     cursor   = ""
     indent   = "  " * depth
     page_num = 0
     printed_first = False
 
-    print(f"{indent}📁 {cat_name}  (id={cat_id})")
+    print(f"{indent}📁 {cat_name}  (id={folder_id})")
+
+    if _FOLDER_BODY_TPL is None:
+        ok = await probe_folder_api(page, folder_id)
+        if not ok:
+            print(f"{indent}  ⚠ 无法确定 API 参数，跳过此分类")
+            return books
+
     while True:
-        body = {"knowledge_base_id": cat_id, "cursor": cursor}
+        body = make_body(folder_id, cursor)
         data = await js_post(page, MEMBER_API, body)
 
         code  = data.get("code", -1)
@@ -133,7 +201,6 @@ async def fetch_category(page, cat_id: str, cat_name: str, depth: int = 0) -> li
             print(f"{indent}  ⚠ code={code}: {msg}")
             break
 
-        # 首页打印第一个 item 完整结构，便于调试字段名
         if not printed_first and items:
             printed_first = True
             print(f"{indent}  [首条 item 结构 depth={depth}]")
@@ -144,18 +211,14 @@ async def fetch_category(page, cat_id: str, cat_name: str, depth: int = 0) -> li
         for item in items:
             if not isinstance(item, dict):
                 continue
-            name  = clean(item.get("name") or item.get("title") or "")
-            itype = item.get("type")
-            is_folder = (itype in (2, "folder", "dir", "directory")
-                         or bool(item.get("is_folder")))
-
-            if is_folder:
+            name = clean(item.get("name") or item.get("title") or "")
+            if is_folder_item(item):
                 fid = extract_id(item)
                 if fid and name:
                     sub = await fetch_category(page, fid, name, depth + 1)
                     books.extend(sub)
                 else:
-                    print(f"{indent}    ⚠ 子文件夹 id={fid!r} name={name!r}，跳过")
+                    print(f"{indent}    ⚠ 子文件夹 fid={fid!r} name={name!r}，跳过")
             elif is_book_name(name):
                 books.append({"书名": name, "分类": cat_name})
 
@@ -202,7 +265,6 @@ async def main():
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"))
             page = await ctx.new_page()
 
-        # ── 监控所有标签页（含新开的）────────────────────────────────────────
         if ctx:
             for p in ctx.pages:
                 register_on_page(p, api_responses)
@@ -215,7 +277,6 @@ async def main():
             print("请登录腾讯账号后按 Enter")
             await async_input(">>> ")
 
-        # ── 导航 ima.qq.com，点击进入知识库 ───────────────────────────────────
         print("\n正在导航到 IMA 主页…")
         await page.goto("https://ima.qq.com", wait_until="domcontentloaded", timeout=40000)
         await asyncio.sleep(3)
@@ -248,20 +309,17 @@ async def main():
         print("\n等待 10 秒，让知识库页面加载完成…")
         await asyncio.sleep(10)
 
-        # ── 打印当前标签页列表 ────────────────────────────────────────────────
         all_pages = ctx.pages if ctx else [page]
         print(f"\n浏览器当前共 {len(all_pages)} 个标签页：")
         for i, p in enumerate(all_pages):
             print(f"  {i+1}. {p.url}")
 
-        # 保存调试数据
         DEBUG_RESP.write_text(
             json.dumps(api_responses[:60], ensure_ascii=False, indent=2),
             encoding="utf-8"
         )
         print(f"共拦截到 {len(api_responses)} 个 API 响应")
 
-        # ── 打印含列表数据的响应摘要 ──────────────────────────────────────────
         print("\n含列表数据的响应：")
         for r in api_responses:
             b = r["body"]
@@ -272,13 +330,11 @@ async def main():
                     first   = val[0]
                     preview = (json.dumps(first, ensure_ascii=False)[:120]
                                if isinstance(first, dict) else str(first)[:120])
-                    req_preview = json.dumps(r["req_body"], ensure_ascii=False)[:60]
-                    print(f"  {r['url'].split('/')[-1]:40s} .{key}={len(val)}项  "
-                          f"req={req_preview}")
+                    req_p   = json.dumps(r["req_body"], ensure_ascii=False)[:60]
+                    print(f"  {r['url'].split('/')[-1]:40s} .{key}={len(val)}项  req={req_p}")
                     print(f"    first={preview}")
                     break
 
-        # ── 找 wikis 标签页 ────────────────────────────────────────────────────
         kb_page = page
         for p in all_pages:
             if "wikis" in p.url or "wiki" in p.url:
@@ -286,8 +342,8 @@ async def main():
                 break
         print(f"\n使用标签页：{kb_page.url}")
 
-        # ── 从已拦截数据中找顶层分类（选 knowledge_list 最多的那条）────────────
-        print("\n在拦截数据中查找顶层分类（get_knowledge_list）…")
+        # ── 从拦截数据中找顶层分类（knowledge_list 最多的那条）────────────────
+        print("\n在拦截数据中查找顶层分类…")
         top_items    = None
         top_req_body = None
 
@@ -304,21 +360,19 @@ async def main():
             print(f"✅ 找到 {len(top_items)} 个顶层分类")
             print(f"   对应请求体：{json.dumps(top_req_body, ensure_ascii=False)}")
         else:
-            # 浏览器未自动触发或拦截失败 → 尝试直接调用
-            print("⚠ 拦截数据中无 knowledge_list，尝试直接调用 API…")
-            candidates = [
+            print("⚠ 拦截数据中无顶层分类，尝试直接调用…")
+            for try_body in [
                 {"knowledge_base_id": KB_FOLDER_ID, "cursor": ""},
                 {"knowledge_base_id": KB_FOLDER_ID},
-                {"cursor": ""},
+                {"folder_id": KB_FOLDER_ID, "cursor": ""},
                 {},
-            ]
-            for try_body in candidates:
+            ]:
                 data = await js_post(kb_page, MEMBER_API, try_body)
                 kl   = data.get("knowledge_list", [])
                 code = data.get("code", -1)
                 print(f"  {json.dumps(try_body)} → code={code}, items={len(kl)}")
                 if code == 0 and kl:
-                    top_items = kl
+                    top_items    = kl
                     top_req_body = try_body
                     print(f"  ✅ 找到 {len(kl)} 个分类！")
                     break
@@ -330,11 +384,9 @@ async def main():
                 await browser.close()
             return
 
-        # 打印第一个分类的完整字段结构（确认 ID 字段名）
         print("\n第一个顶层分类完整字段结构：")
         print(json.dumps(top_items[0], ensure_ascii=False, indent=2))
 
-        # 列出所有分类名称和 ID
         print(f"\n所有 {len(top_items)} 个顶层分类：")
         for i, item in enumerate(top_items, 1):
             nm  = clean(item.get("name") or item.get("title") or "?")
@@ -348,7 +400,7 @@ async def main():
             cat_name = clean(item.get("name") or item.get("title") or "")
             cat_id   = extract_id(item)
             if not cat_name or not cat_id:
-                print(f"  ⚠ 跳过无效分类：{json.dumps(item, ensure_ascii=False)[:80]}")
+                print(f"  ⚠ 跳过：name={cat_name!r} id={cat_id!r}")
                 continue
             cat_books = await fetch_category(kb_page, cat_id, cat_name, depth=1)
             books.extend(cat_books)
@@ -358,7 +410,6 @@ async def main():
         if not using_cdp:
             await browser.close()
 
-    # ── 写 CSV ────────────────────────────────────────────────────────────────
     if not books:
         print(f"\n⚠ 未提取到书目，请把 {DEBUG_RESP.name} 发给我分析。")
         return
