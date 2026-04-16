@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 """
-腾讯 IMA 知识库书单提取脚本 v7（终版）
+腾讯 IMA 知识库书单提取脚本 v8
 策略：
-  1. 拦截浏览器初始化请求，获取22个顶层文件夹
-  2. 对每个文件夹：goto wikis根 → 等待元素可见 → 点击 → 等待API响应
-  3. 发现子文件夹时自动加入队列继续导航
-  4. 自动导航失败的文件夹 → 列出请求用户手动点击
-  5. 从所有拦截到的 code=0 响应中提取书目，
-     用 item.parent_folder_id 追溯顶层分类（不依赖 req_body）
+  1. 用户手动点击22个顶层文件夹（每个等1-2秒）→ 脚本拦截所有响应
+  2. 从成功响应里自动发现 API 请求体格式和请求头
+  3. 用 Playwright APIRequestContext 直接调用 API（共享浏览器 cookies）
+     自动 BFS 遍历全部子文件夹，无需人工再点击
+  4. 每个 item 用 parent_folder_id 反推顶层分类
 """
 
 import asyncio
 import csv
 import json
 import re
-from collections import Counter
+from collections import Counter, deque
 from pathlib import Path
 
 from playwright.async_api import async_playwright, BrowserContext
@@ -56,7 +55,17 @@ def register_on_page(p, api_responses: list):
                 req_body = json.loads(response.request.post_data or "{}")
             except Exception:
                 req_body = {}
-            api_responses.append({"url": response.url, "req_body": req_body, "body": rb})
+            # 同时捕获请求头，用于后续复现
+            try:
+                req_headers = dict(response.request.headers)
+            except Exception:
+                req_headers = {}
+            api_responses.append({
+                "url":         response.url,
+                "req_body":    req_body,
+                "req_headers": req_headers,
+                "body":        rb,
+            })
         except Exception:
             pass
     p.on("response", on_resp)
@@ -79,28 +88,23 @@ def extract_id(item: dict) -> str:
 
 
 def is_folder_item(item: dict) -> bool:
-    """media_id 以 folder_ 开头才算文件夹；PPT/PDF 等以其他前缀开头不算。"""
     mid = item.get("media_id", "")
     if isinstance(mid, str):
         if mid.startswith("folder_"):
             return True
-        if mid:        # 有 media_id 但不是 folder_ 开头 → 文档
+        if mid:
             return False
-    # 无 media_id 时参考 type 字段
     return item.get("type") in (2, "folder", "dir", "directory") or bool(item.get("is_folder"))
 
 
 def get_top_category(folder_id: str, id_to_name: dict, id_to_parent: dict) -> str:
-    """
-    沿 parent_folder_id 链上溯，找到直接挂在根 KB 下的顶层分类名称。
-    """
     cur = folder_id
     visited: set = set()
     while cur and cur not in visited:
         visited.add(cur)
         parent = id_to_parent.get(cur, "")
         if not parent or parent == KB_FOLDER_ID:
-            return id_to_name.get(cur, cur)
+            return id_to_name.get(cur, "未知分类")
         cur = parent
     return id_to_name.get(cur or folder_id, "未知分类")
 
@@ -117,73 +121,170 @@ async def try_click(page, selectors: list, timeout_ms: int = 3000) -> bool:
     return False
 
 
-async def navigate_to_folder(kb_page, wikis_root_url: str, folder_name: str) -> bool:
+# ── API 直接调用（用浏览器 cookies + 正确 headers）──────────────────────────
+
+async def direct_api_call(kb_page, body: dict,
+                          extra_headers: dict | None = None) -> dict:
     """
-    强制回到 wikis 根视图（goto），等待文件夹元素出现，再点击。
-    使用 wait_for(visible) 应对 React 异步渲染。
+    通过 Playwright APIRequestContext 直接调用 API。
+    共享浏览器 context 的 cookies，可设置任意请求头。
     """
+    headers = {
+        "Content-Type":  "application/json",
+        "Accept":        "application/json, */*",
+        "Origin":        "https://ima.qq.com",
+        "Referer":       "https://ima.qq.com/wikis",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
     try:
-        await kb_page.goto(wikis_root_url, wait_until="domcontentloaded", timeout=20000)
-    except Exception:
-        pass
-    await asyncio.sleep(1)   # 额外 1 秒让 React 开始渲染
-
-    selectors = [
-        f':text-is("{folder_name}")',
-        f'span:has-text("{folder_name}")',
-        f'[title="{folder_name}"]',
-        f'li:has-text("{folder_name}")',
-        f'div[class*="folder"]:has-text("{folder_name}")',
-    ]
-    for sel in selectors:
-        try:
-            loc = kb_page.locator(sel).first
-            await loc.wait_for(state="visible", timeout=6000)  # 等最多6秒
-            await loc.click()
-            return True
-        except Exception:
-            pass
-    return False
+        resp = await kb_page.request.post(
+            MEMBER_API,
+            data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+            headers=headers,
+        )
+        return await resp.json()
+    except Exception as e:
+        return {"code": -1, "error": str(e)}
 
 
-def absorb_responses(api_responses: list, start: int,
-                     id_to_name: dict, id_to_parent: dict) -> tuple[list, list]:
+def discover_template(api_responses: list) -> tuple[dict | None, dict]:
     """
-    处理 api_responses[start:] 中所有 get_knowledge_list code=0 的响应：
-    - 更新 id_to_name / id_to_parent（从 item.parent_folder_id 建图）
-    - 返回 (books_list, new_folder_items_list)
+    从已拦截的成功响应里发现：
+    - body_template: 请求体模板，"__ID__" 是 folder_id 占位符
+    - extra_headers: 浏览器额外发送的请求头（排除 content-type 等通用头）
     """
-    books: list   = []
-    new_folders: list = []
-    seen: set     = set()
-
-    for r in api_responses[start:]:
+    SKIP_HEADERS = {
+        "content-type", "content-length", "accept", "accept-encoding",
+        "accept-language", "connection", "host", "origin", "referer",
+        "user-agent", "cookie",
+    }
+    for r in api_responses:
         if "get_knowledge_list" not in r["url"]:
             continue
-        b = r.get("body", {})
-        if not isinstance(b, dict) or b.get("code") != 0:
+        b  = r.get("body", {})
+        kl = b.get("knowledge_list", []) if isinstance(b, dict) and b.get("code") == 0 else []
+        if not kl:
             continue
-        kl = b.get("knowledge_list", [])
+        req = r.get("req_body", {})
+        if not req:
+            continue
 
-        for item in kl:
-            if not isinstance(item, dict):
-                continue
-            name  = clean(item.get("name") or item.get("title") or "")
-            fid   = extract_id(item)
-            pfid  = item.get("parent_folder_id", "") or ""
+        # 找请求体里含有 folder_ 前缀的字段
+        folder_key = None
+        static = {}
+        for k, v in req.items():
+            if isinstance(v, str) and v.startswith("folder_"):
+                folder_key = k
+            else:
+                static[k] = v
 
-            if is_folder_item(item):
-                if fid:
-                    if name:
-                        id_to_name.setdefault(fid, name)
-                    id_to_parent.setdefault(fid, pfid)
-                    new_folders.append(item)
-            elif is_book_name(name) and name not in seen:
-                seen.add(name)
-                cat = get_top_category(pfid, id_to_name, id_to_parent) if pfid else "根目录"
-                books.append({"书名": name, "分类": cat})
+        if folder_key:
+            tpl = {folder_key: "__ID__"}
+            tpl.update(static)
+            extra = {k: v for k, v in r.get("req_headers", {}).items()
+                     if k.lower() not in SKIP_HEADERS}
+            return tpl, extra
 
+    return None, {}
+
+
+def make_body(template: dict, folder_id: str, cursor: str = "") -> dict:
+    body = {k: (folder_id if v == "__ID__" else v) for k, v in template.items()}
+    body["cursor"] = cursor
+    return body
+
+
+def absorb_items(kl: list,
+                 id_to_name: dict, id_to_parent: dict,
+                 seen_books: set) -> tuple[list, list]:
+    """处理一批 knowledge_list items，返回 (books, new_folder_items)。"""
+    books:      list = []
+    new_folders: list = []
+    for item in kl:
+        if not isinstance(item, dict):
+            continue
+        name = clean(item.get("name") or item.get("title") or "")
+        fid  = extract_id(item)
+        pfid = item.get("parent_folder_id", "") or ""
+        if is_folder_item(item):
+            if fid:
+                if name:
+                    id_to_name.setdefault(fid, name)
+                id_to_parent.setdefault(fid, pfid)
+                new_folders.append(item)
+        elif is_book_name(name) and name not in seen_books:
+            seen_books.add(name)
+            cat = get_top_category(pfid, id_to_name, id_to_parent) if pfid else KB_NAME
+            books.append({"书名": name, "分类": cat})
     return books, new_folders
+
+
+async def bfs_fetch(kb_page, root_folders: list,
+                    id_to_name: dict, id_to_parent: dict,
+                    seen_books: set, template: dict,
+                    extra_headers: dict) -> list:
+    """
+    BFS 遍历所有子文件夹，用直接 API 调用提取书目。
+    返回提取到的书目列表。
+    """
+    books: list = []
+    queue: deque = deque(root_folders)
+    total = len(queue)
+    done  = 0
+
+    print(f"\n开始 BFS 直接 API 提取（队列 {total} 个文件夹）…")
+
+    while queue:
+        item = queue.popleft()
+        fid  = extract_id(item)
+        fname = clean(item.get("name") or item.get("title") or "")
+        if not fid:
+            continue
+
+        done += 1
+        if done % 20 == 0 or done <= 5:
+            print(f"  [{done}/{total}] 📁 {fname} …", end="", flush=True)
+
+        cursor = ""
+        page_n = 0
+        folder_books = 0
+        folder_subs  = 0
+
+        while True:
+            body = make_body(template, fid, cursor)
+            data = await direct_api_call(kb_page, body, extra_headers)
+            code = data.get("code", -1)
+            kl   = data.get("knowledge_list", [])
+            page_n += 1
+
+            if code != 0:
+                if done % 20 == 0 or done <= 5:
+                    print(f" ⚠ code={code}")
+                break
+
+            new_books, new_folders = absorb_items(
+                kl, id_to_name, id_to_parent, seen_books)
+            books.extend(new_books)
+            folder_books += len(new_books)
+            folder_subs  += len(new_folders)
+
+            for sf in new_folders:
+                queue.append(sf)
+                total += 1
+
+            next_cur = data.get("next_cursor", "")
+            if data.get("is_end", True) or not kl or not next_cur or next_cur == cursor:
+                break
+            cursor = next_cur
+            await asyncio.sleep(0.2)
+
+        if done % 20 == 0 or done <= 5:
+            print(f" ✓ {folder_books}本书, {folder_subs}子文件夹")
+        await asyncio.sleep(0.15)
+
+    print(f"\nBFS 完成：共处理 {done} 个文件夹，提取 {len(books)} 本书")
+    return books
 
 
 async def main():
@@ -253,38 +354,25 @@ async def main():
             f':text-is("{KB_NAME}")', f'text="{KB_NAME}"', f':text("{KB_NAME}")',
             f'[title="{KB_NAME}"]', f'span:has-text("{KB_NAME}")', f'a:has-text("{KB_NAME}")',
         ], timeout_ms=5000)
-
         if ok:
             print("  ✅ 已自动点击")
         else:
-            print(f"  ⚠ 自动点击失败，请在 360 浏览器里手动点击左侧「{KB_NAME}」后按 Enter…")
+            print(f"  ⚠ 请手动点击左侧「{KB_NAME}」后按 Enter…")
             await async_input("  >>> ")
 
         print("\n等待 10 秒，让知识库页面加载完成…")
         await asyncio.sleep(10)
 
         all_pages = ctx.pages if ctx else [page]
-        print(f"\n浏览器当前共 {len(all_pages)} 个标签页：")
-        for i, p in enumerate(all_pages):
-            print(f"  {i+1}. {p.url}")
-
-        DEBUG_RESP.write_text(
-            json.dumps(api_responses[:60], ensure_ascii=False, indent=2),
-            encoding="utf-8"
-        )
-        print(f"共拦截到 {len(api_responses)} 个 API 响应")
-
-        # ── 找 wikis 标签页 ────────────────────────────────────────────────────
         kb_page = page
         for p in all_pages:
             if "wikis" in p.url or "wiki" in p.url:
                 kb_page = p
                 break
-        wikis_root_url = kb_page.url
-        print(f"使用标签页：{wikis_root_url}")
+        print(f"\n使用标签页：{kb_page.url}")
+        print(f"共拦截到 {len(api_responses)} 个 API 响应")
 
-        # ── 从拦截数据中找22个顶层分类 ────────────────────────────────────────
-        print("\n在拦截数据中查找顶层分类…")
+        # ── 获取22个顶层分类 ──────────────────────────────────────────────────
         top_items: list = []
         for r in api_responses:
             if "get_knowledge_list" not in r["url"]:
@@ -295,120 +383,122 @@ async def main():
                 top_items = kl
 
         if not top_items:
-            print(f"⚠ 未找到顶层分类，请把 {DEBUG_RESP.name} 发给我分析。")
+            print(f"⚠ 未找到顶层分类。请把 {DEBUG_RESP.name} 发给我分析。")
             if not using_cdp:
                 await browser.close()
             return
 
-        # 建立 ID 映射
         id_to_name:   dict[str, str] = {}
         id_to_parent: dict[str, str] = {}
-        for item in top_items:
-            fid  = extract_id(item)
-            name = clean(item.get("name") or item.get("title") or "")
-            pfid = item.get("parent_folder_id", "") or ""
+        for it in top_items:
+            fid  = extract_id(it)
+            name = clean(it.get("name") or it.get("title") or "")
+            pfid = it.get("parent_folder_id", "") or ""
             if fid and name:
                 id_to_name[fid]   = name
                 id_to_parent[fid] = pfid
 
         folder_items = [it for it in top_items if is_folder_item(it)]
         doc_items    = [it for it in top_items if not is_folder_item(it)]
+        print(f"✅ 顶层：{len(folder_items)} 个文件夹 + {len(doc_items)} 个文档")
 
-        print(f"✅ 找到 {len(top_items)} 个顶层条目：{len(folder_items)} 个文件夹，{len(doc_items)} 个文档")
-        for i, it in enumerate(top_items, 1):
-            nm = clean(it.get("name") or it.get("title") or "?")
-            tp = "📁" if is_folder_item(it) else "📄"
-            print(f"  {i:2d}. {tp} {nm}")
+        seen_books: set  = set()
+        books:      list = []
 
-        # ── 收集顶层直接文档 ─────────────────────────────────────────────────
-        books: list = []
-        seen_books: set = set()
+        # 顶层直接文档
         for it in doc_items:
             nm = clean(it.get("name") or it.get("title") or "")
             if is_book_name(nm) and nm not in seen_books:
                 seen_books.add(nm)
                 books.append({"书名": nm, "分类": KB_NAME})
 
-        # ── 自动导航所有文件夹（BFS 队列）──────────────────────────────────────
-        # 队列元素：(folder_item, parent_name_for_display)
-        nav_queue: list = [(it, "") for it in folder_items]
-        failed_folders: list = []   # (folder_name, parent_display) 自动失败的
+        # ── 第一阶段：请用户点击22个顶层文件夹（一次性操作）────────────────────
+        print(f"\n{'='*65}")
+        print("【第一步】请在 360 浏览器里依次点击以下 22 个顶层文件夹：")
+        print("（每点一个等 1-2 秒，让页面加载完再点下一个）\n")
+        for i, it in enumerate(folder_items, 1):
+            nm = clean(it.get("name") or it.get("title") or "")
+            print(f"  {i:2d}. {nm}")
+        print(f"\n全部点完后按 Enter…")
+        print(f"{'='*65}")
+        count_phase1 = len(api_responses)
+        await async_input(">>> ")
+        await asyncio.sleep(3)
 
-        print(f"\n开始自动导航（共 {len(nav_queue)} 个顶层文件夹）…\n")
+        # 处理第一阶段响应
+        phase1_books:   list = []
+        phase1_folders: list = []
+        for r in api_responses[count_phase1:]:
+            if "get_knowledge_list" not in r["url"]:
+                continue
+            b  = r.get("body", {})
+            kl = b.get("knowledge_list", []) if isinstance(b, dict) and b.get("code") == 0 else []
+            if not kl:
+                continue
+            nb, nf = absorb_items(kl, id_to_name, id_to_parent, seen_books)
+            phase1_books.extend(nb)
+            phase1_folders.extend(nf)
 
-        while nav_queue:
-            item, parent_display = nav_queue.pop(0)
-            fname = clean(item.get("name") or item.get("title") or "")
-            fid   = extract_id(item)
-            label = f"{parent_display} → {fname}" if parent_display else fname
+        books.extend(phase1_books)
+        print(f"\n第一阶段拦截：{len(phase1_books)} 本书，{len(phase1_folders)} 个子文件夹")
 
-            print(f"  📁 {label} …", end="", flush=True)
-            count_before = len(api_responses)
+        # ── 发现 API 参数模板 ────────────────────────────────────────────────
+        template, extra_headers = discover_template(api_responses[count_phase1:])
 
-            ok = await navigate_to_folder(kb_page, wikis_root_url, fname)
-            await asyncio.sleep(3)   # 等待 API 响应
-
-            if ok:
-                new_books, new_folders = absorb_responses(
-                    api_responses, count_before, id_to_name, id_to_parent)
-                for b in new_books:
-                    if b["书名"] not in seen_books:
-                        seen_books.add(b["书名"])
-                        books.append(b)
-                # 子文件夹加入队列
-                for sub in new_folders:
-                    sub_name = clean(sub.get("name") or sub.get("title") or "")
-                    if sub_name and extract_id(sub) not in {extract_id(q[0]) for q in nav_queue}:
-                        nav_queue.append((sub, fname))
-                print(f" ✓ 提取 {len(new_books)} 本书，{len(new_folders)} 个子文件夹")
+        if template:
+            print(f"\n✅ 发现 API 参数模板：{template}")
+            print(f"   额外请求头：{list(extra_headers.keys()) or '（无）'}")
+        else:
+            # 尝试从顶层响应里找模板（空 body）
+            print("\n⚠ 未从子文件夹响应中发现含 folder_ 的请求体")
+            print("  尝试从拦截到的所有响应里推断…")
+            template, extra_headers = discover_template(api_responses)
+            if template:
+                print(f"  ✅ 找到：{template}")
             else:
-                failed_folders.append((fname, parent_display))
-                print(f" ⚠ 自动失败")
+                print("  ❌ 仍未找到模板，将尝试常见参数组合…")
+                # 用第一个成功的子文件夹 ID 来探测
+                if phase1_folders:
+                    test_fid = extract_id(phase1_folders[0])
+                    for try_body in [
+                        {"folder_id": test_fid, "cursor": ""},
+                        {"knowledge_base_id": KB_FOLDER_ID, "folder_id": test_fid, "cursor": ""},
+                        {"knowledge_base_id": test_fid, "cursor": ""},
+                    ]:
+                        d = await direct_api_call(kb_page, try_body, extra_headers)
+                        code = d.get("code", -1)
+                        kl   = d.get("knowledge_list", [])
+                        print(f"  {try_body} → code={code}, items={len(kl)}")
+                        if code == 0:
+                            # Build template
+                            for k, v in try_body.items():
+                                if v == test_fid:
+                                    template = {k: "__ID__"}
+                                    for k2, v2 in try_body.items():
+                                        if k2 != k and k2 != "cursor":
+                                            template[k2] = v2
+                                    break
+                            if template:
+                                print(f"  ✅ 探测成功：{template}")
+                                break
+                        await asyncio.sleep(0.3)
 
-        # ── 自动失败的文件夹：请用户手动点击 ──────────────────────────────────
-        if failed_folders:
-            print(f"\n{'='*60}")
-            print(f"以下 {len(failed_folders)} 个文件夹未能自动导航，请在 360 浏览器里依次点击：")
-            for fname, pdisplay in failed_folders:
-                label = f"  {pdisplay} → {fname}" if pdisplay else f"  {fname}"
-                print(label)
-            print("\n全部点完后按 Enter（每个点击等 1-2 秒再点下一个）…")
-            count_manual = len(api_responses)
-            await async_input(">>> ")
-            await asyncio.sleep(3)
+        # ── 第二阶段：BFS 自动提取所有子文件夹 ──────────────────────────────
+        if template and phase1_folders:
+            bfs_books = await bfs_fetch(
+                kb_page, phase1_folders, id_to_name, id_to_parent,
+                seen_books, template, extra_headers)
+            books.extend(bfs_books)
+        elif phase1_folders:
+            print(f"\n⚠ 未能发现可用的 API 参数，无法自动提取 {len(phase1_folders)} 个子文件夹")
+            print(f"  请把 {DEBUG_RESP.name} 发给我分析。")
 
-            manual_books, manual_folders = absorb_responses(
-                api_responses, count_manual, id_to_name, id_to_parent)
-            for b in manual_books:
-                if b["书名"] not in seen_books:
-                    seen_books.add(b["书名"])
-                    books.append(b)
-            print(f"手动阶段提取 {len(manual_books)} 本书，{len(manual_folders)} 个新子文件夹")
-
-            # 若还有更深子文件夹
-            if manual_folders:
-                print(f"\n{'='*60}")
-                print(f"还发现 {len(manual_folders)} 个子文件夹，请继续点击：")
-                for sf in manual_folders:
-                    print(f"  {clean(sf.get('name') or sf.get('title') or '')}")
-                print("完成后按 Enter…")
-                count_deep = len(api_responses)
-                await async_input(">>> ")
-                await asyncio.sleep(3)
-                deep_books, _ = absorb_responses(
-                    api_responses, count_deep, id_to_name, id_to_parent)
-                for b in deep_books:
-                    if b["书名"] not in seen_books:
-                        seen_books.add(b["书名"])
-                        books.append(b)
-                print(f"深层提取 {len(deep_books)} 本书")
-
-        # 保存最终调试数据
+        # 保存调试数据
         DEBUG_RESP.write_text(
             json.dumps(api_responses, ensure_ascii=False, indent=2),
             encoding="utf-8"
         )
-        print(f"\n共拦截到 {len(api_responses)} 个 API 响应，已保存至 {DEBUG_RESP.name}")
+        print(f"\n共拦截 {len(api_responses)} 个响应，已保存至 {DEBUG_RESP.name}")
 
         if not using_cdp:
             await browser.close()
