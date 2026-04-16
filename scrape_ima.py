@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
 腾讯 IMA 知识库书单提取脚本
-API：knowledge_tab_reader/get_knowledge_list
-- 调用 {} → 22 个顶层分类（含各自的 knowledge_base_id）
-- 调用 {"knowledge_base_id": X} → 分类下的书目/子文件夹
+策略：
+  1. 监控浏览器打开追梦人KB时自动发出的 get_knowledge_list 请求，拦截22个顶层分类
+  2. 对每个分类用 knowledge_base_id 参数递归提取书目
+  注意：直接调用 {} 会返回 code=51，必须复用浏览器拦截的数据
 """
 
 import asyncio
@@ -16,12 +17,13 @@ from pathlib import Path
 from playwright.async_api import async_playwright, BrowserContext
 
 # ── 配置 ──────────────────────────────────────────────────────────────────────
-KB_NAME    = "追梦人的财经图书馆"
-MEMBER_API = "https://ima.qq.com/cgi-bin/knowledge_tab_reader/get_knowledge_list"
-PROXY      = "http://127.0.0.1:10808"
-CDP_URL    = "http://localhost:9222"
-OUTPUT_CSV = Path(__file__).parent / "ima_booklist.csv"
-DEBUG_RESP = Path(__file__).parent / "ima_raw.json"
+KB_NAME      = "追梦人的财经图书馆"
+KB_FOLDER_ID = "7374371035301653"          # 根知识库 ID（备用）
+MEMBER_API   = "https://ima.qq.com/cgi-bin/knowledge_tab_reader/get_knowledge_list"
+PROXY        = "http://127.0.0.1:10808"
+CDP_URL      = "http://localhost:9222"
+OUTPUT_CSV   = Path(__file__).parent / "ima_booklist.csv"
+DEBUG_RESP   = Path(__file__).parent / "ima_raw.json"
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -59,15 +61,8 @@ async def js_post(page, url: str, body: dict) -> dict:
         return {"code": -1, "error": str(e)}
 
 
-def register_on_page(p, req_bodies: dict, api_responses: list):
-    def on_req(request):
-        if "ima.qq.com/cgi-bin" not in request.url:
-            return
-        try:
-            body = json.loads(request.post_data or "{}")
-        except Exception:
-            body = {}
-        req_bodies[request.url] = body
+def register_on_page(p, api_responses: list):
+    """拦截页面上所有 ima.qq.com API 请求/响应。"""
 
     async def on_resp(response):
         if "ima.qq.com" not in response.url:
@@ -76,15 +71,19 @@ def register_on_page(p, req_bodies: dict, api_responses: list):
             if "json" not in response.headers.get("content-type", ""):
                 return
             rb = await response.json()
+            # 直接从 response.request 读请求体，避免竞态
+            try:
+                req_body = json.loads(response.request.post_data or "{}")
+            except Exception:
+                req_body = {}
             api_responses.append({
-                "url": response.url,
-                "req_body": req_bodies.get(response.url, {}),
-                "body": rb,
+                "url":      response.url,
+                "req_body": req_body,
+                "body":     rb,
             })
         except Exception:
             pass
 
-    p.on("request",  on_req)
     p.on("response", on_resp)
 
 
@@ -101,8 +100,9 @@ async def try_click(page, selectors: list, timeout_ms: int = 3000) -> bool:
 
 
 def extract_id(item: dict) -> str:
-    """从 item 中提取知识库/文件夹 ID（尝试多个字段名）"""
-    for field in ["knowledge_base_id", "folder_id", "id", "kb_id", "knowledge_id", "node_id"]:
+    """从 item 中提取知识库/文件夹 ID（尝试多个字段名）。"""
+    for field in ["knowledge_base_id", "folder_id", "id", "kb_id",
+                  "knowledge_id", "node_id"]:
         val = item.get(field)
         if val and isinstance(val, str) and val.strip():
             return val.strip()
@@ -112,15 +112,12 @@ def extract_id(item: dict) -> str:
 
 
 async def fetch_category(page, cat_id: str, cat_name: str, depth: int = 0) -> list:
-    """
-    用 knowledge_base_id=cat_id 递归提取某分类下所有书目。
-    书目归属到直接所在的文件夹名（cat_name）。
-    """
-    books  = []
-    cursor = ""
-    indent = "  " * depth
-    first_page = True
+    """用 knowledge_base_id=cat_id 递归提取某分类下所有书目。"""
+    books    = []
+    cursor   = ""
+    indent   = "  " * depth
     page_num = 0
+    printed_first = False
 
     print(f"{indent}📁 {cat_name}  (id={cat_id})")
     while True:
@@ -136,10 +133,10 @@ async def fetch_category(page, cat_id: str, cat_name: str, depth: int = 0) -> li
             print(f"{indent}  ⚠ code={code}: {msg}")
             break
 
-        # 首页打印第一个 item 完整结构，便于调试
-        if first_page and items:
-            first_page = False
-            print(f"{indent}  [第一个 item 结构，depth={depth}]")
+        # 首页打印第一个 item 完整结构，便于调试字段名
+        if not printed_first and items:
+            printed_first = True
+            print(f"{indent}  [首条 item 结构 depth={depth}]")
             print(json.dumps(items[0], ensure_ascii=False, indent=4))
 
         print(f"{indent}  第{page_num}页：{len(items)} 条")
@@ -149,9 +146,8 @@ async def fetch_category(page, cat_id: str, cat_name: str, depth: int = 0) -> li
                 continue
             name  = clean(item.get("name") or item.get("title") or "")
             itype = item.get("type")
-
-            # type=2 通常表示子文件夹；如有 is_folder 字段也识别
-            is_folder = itype in (2, "folder", "dir", "directory") or bool(item.get("is_folder"))
+            is_folder = (itype in (2, "folder", "dir", "directory")
+                         or bool(item.get("is_folder")))
 
             if is_folder:
                 fid = extract_id(item)
@@ -177,14 +173,12 @@ async def main():
     if PROXY:
         browser_args.append(f"--proxy-server={PROXY}")
 
-    req_bodies    = {}
-    api_responses = []
+    api_responses: list = []
 
     async with async_playwright() as pw:
         using_cdp = False
         ctx: BrowserContext | None = None
 
-        # ── 连接 360浏览器（CDP）或启动内置 Chromium ──────────────────────────
         try:
             browser  = await pw.chromium.connect_over_cdp(CDP_URL)
             ctx      = browser.contexts[0] if browser.contexts else None
@@ -211,10 +205,10 @@ async def main():
         # ── 监控所有标签页（含新开的）────────────────────────────────────────
         if ctx:
             for p in ctx.pages:
-                register_on_page(p, req_bodies, api_responses)
-            ctx.on("page", lambda np: register_on_page(np, req_bodies, api_responses))
+                register_on_page(p, api_responses)
+            ctx.on("page", lambda np: register_on_page(np, api_responses))
         else:
-            register_on_page(page, req_bodies, api_responses)
+            register_on_page(page, api_responses)
 
         if not using_cdp:
             await page.goto("https://ima.qq.com", wait_until="domcontentloaded", timeout=40000)
@@ -227,12 +221,14 @@ async def main():
         await asyncio.sleep(3)
 
         print("步骤1：点击「个人知识库」…")
-        ok = await try_click(page, [':text-is("个人知识库")', 'text="个人知识库"', ':text("个人知识库")'])
+        ok = await try_click(page, [':text-is("个人知识库")',
+                                    'text="个人知识库"', ':text("个人知识库")'])
         print(f"  {'✅' if ok else '（已展开）'}")
         await asyncio.sleep(3)
 
         print("步骤2：点击「共享知识库」…")
-        await try_click(page, [':text-is("共享知识库")', 'text="共享知识库"', ':text("共享知识库")'], timeout_ms=2000)
+        await try_click(page, [':text-is("共享知识库")',
+                                'text="共享知识库"', ':text("共享知识库")'], timeout_ms=2000)
         await asyncio.sleep(2)
 
         print(f"步骤3：点击「{KB_NAME}」…")
@@ -260,12 +256,12 @@ async def main():
 
         # 保存调试数据
         DEBUG_RESP.write_text(
-            json.dumps(api_responses[:50], ensure_ascii=False, indent=2),
+            json.dumps(api_responses[:60], ensure_ascii=False, indent=2),
             encoding="utf-8"
         )
         print(f"共拦截到 {len(api_responses)} 个 API 响应")
 
-        # ── 打印所有含非空列表的响应 ──────────────────────────────────────────
+        # ── 打印含列表数据的响应摘要 ──────────────────────────────────────────
         print("\n含列表数据的响应：")
         for r in api_responses:
             b = r["body"]
@@ -274,8 +270,12 @@ async def main():
             for key, val in b.items():
                 if isinstance(val, list) and len(val) > 0 and key != "current_path":
                     first   = val[0]
-                    preview = json.dumps(first, ensure_ascii=False)[:120] if isinstance(first, dict) else str(first)[:120]
-                    print(f"  {r['url'].split('/')[-1]:40s} .{key}={len(val)}项  first={preview}")
+                    preview = (json.dumps(first, ensure_ascii=False)[:120]
+                               if isinstance(first, dict) else str(first)[:120])
+                    req_preview = json.dumps(r["req_body"], ensure_ascii=False)[:60]
+                    print(f"  {r['url'].split('/')[-1]:40s} .{key}={len(val)}项  "
+                          f"req={req_preview}")
+                    print(f"    first={preview}")
                     break
 
         # ── 找 wikis 标签页 ────────────────────────────────────────────────────
@@ -286,22 +286,51 @@ async def main():
                 break
         print(f"\n使用标签页：{kb_page.url}")
 
-        # ── 调用 MEMBER_API {{}} 获取顶层分类列表 ─────────────────────────────
-        print(f"\n调用 get_knowledge_list {{}} 获取顶层分类…")
-        top_data  = await js_post(kb_page, MEMBER_API, {})
-        top_code  = top_data.get("code", -1)
-        top_items = top_data.get("knowledge_list", [])
-        print(f"code={top_code}，知识库列表={len(top_items)} 个")
+        # ── 从已拦截数据中找顶层分类（选 knowledge_list 最多的那条）────────────
+        print("\n在拦截数据中查找顶层分类（get_knowledge_list）…")
+        top_items    = None
+        top_req_body = None
 
-        if top_code != 0 or not top_items:
-            print(f"\n⚠ 无法获取顶层分类（code={top_code}）")
-            print(f"  msg={top_data.get('msg', top_data.get('error', ''))}")
-            print(f"  请把 {DEBUG_RESP.name} 发给我分析。")
+        for r in api_responses:
+            if "get_knowledge_list" not in r["url"]:
+                continue
+            b  = r.get("body", {})
+            kl = b.get("knowledge_list", []) if isinstance(b, dict) and b.get("code") == 0 else []
+            if len(kl) > len(top_items or []):
+                top_items    = kl
+                top_req_body = r.get("req_body", {})
+
+        if top_items:
+            print(f"✅ 找到 {len(top_items)} 个顶层分类")
+            print(f"   对应请求体：{json.dumps(top_req_body, ensure_ascii=False)}")
+        else:
+            # 浏览器未自动触发或拦截失败 → 尝试直接调用
+            print("⚠ 拦截数据中无 knowledge_list，尝试直接调用 API…")
+            candidates = [
+                {"knowledge_base_id": KB_FOLDER_ID, "cursor": ""},
+                {"knowledge_base_id": KB_FOLDER_ID},
+                {"cursor": ""},
+                {},
+            ]
+            for try_body in candidates:
+                data = await js_post(kb_page, MEMBER_API, try_body)
+                kl   = data.get("knowledge_list", [])
+                code = data.get("code", -1)
+                print(f"  {json.dumps(try_body)} → code={code}, items={len(kl)}")
+                if code == 0 and kl:
+                    top_items = kl
+                    top_req_body = try_body
+                    print(f"  ✅ 找到 {len(kl)} 个分类！")
+                    break
+                await asyncio.sleep(0.3)
+
+        if not top_items:
+            print(f"\n⚠ 所有方式均未获取到顶层分类，请把 {DEBUG_RESP.name} 发给我分析。")
             if not using_cdp:
                 await browser.close()
             return
 
-        # 打印第一个分类的完整字段结构（用于确认 ID 字段名）
+        # 打印第一个分类的完整字段结构（确认 ID 字段名）
         print("\n第一个顶层分类完整字段结构：")
         print(json.dumps(top_items[0], ensure_ascii=False, indent=2))
 
