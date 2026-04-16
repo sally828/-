@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 腾讯 IMA 知识库书单提取脚本
-以成员身份登录，自动点击共享知识库，拦截真实 API 参数，递归提取完整书单
+已知 API 端点和根目录 ID，直接调用递归提取完整书单
 """
 
 import asyncio
@@ -15,11 +15,14 @@ from playwright.async_api import async_playwright
 
 # ── 配置 ──────────────────────────────────────────────────────────────────────
 KB_NAME    = "追梦人的财经图书馆"
+SHARE_URL  = "https://ima.qq.com/wiki/?shareId=80155f2d7bdbe7249ae15f61cb22c37f997fb4dc0f8f60dfd70185a94e4905f5"
+SHARE_ID   = "80155f2d7bdbe7249ae15f61cb22c37f997fb4dc0f8f60dfd70185a94e4905f5"
+ROOT_ID    = "7374371035301653"
+API_URL    = "https://ima.qq.com/cgi-bin/knowledge_share_get/get_share_info"
 PROXY      = "http://127.0.0.1:10808"
 CDP_URL    = "http://localhost:9222"
 OUTPUT_CSV = Path(__file__).parent / "ima_booklist.csv"
-DEBUG_REQ  = Path(__file__).parent / "ima_requests.json"
-DEBUG_RESP = Path(__file__).parent / "ima_raw.json"
+DEBUG_JSON = Path(__file__).parent / "ima_debug.json"
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -33,16 +36,8 @@ def is_book_name(name: str) -> bool:
     return len(name) >= 3 and not name.startswith("http")
 
 
-def is_knowledge_api(url: str) -> bool:
-    """判断是否为知识库内容 API（排除静态资源）"""
-    static_exts = ('.js', '.css', '.png', '.jpg', '.ico', '.woff', '.woff2', '.svg', '.map')
-    if any(url.endswith(ext) or ('.' + ext.lstrip('.') + '?') in url for ext in static_exts):
-        return False
-    keywords = ('knowledge', 'folder', 'node', 'list', 'file')
-    return any(k in url for k in keywords) and 'cgi-bin' in url
-
-
-async def call_api(page, url: str, body: dict) -> dict:
+async def api_call(page, body: dict) -> dict:
+    """在浏览器 cookies 上下文中 POST 调用 get_share_info"""
     return await page.evaluate("""
         async (args) => {
             try {
@@ -55,15 +50,59 @@ async def call_api(page, url: str, body: dict) -> dict:
                 return await r.json();
             } catch(e) { return {code: -1, error: e.toString()}; }
         }
-    """, {"url": url, "body": body}) or {}
+    """, {"url": API_URL, "body": body}) or {}
 
 
-async def fetch_folder(page, api_url: str, base_body: dict,
-                       folder_id: str, folder_name: str, depth: int = 0) -> list:
+async def find_working_template(page) -> dict | None:
+    """
+    探测哪种 body 格式能让 knowledge_list 返回真实内容。
+    候选格式从最简到最完整依次尝试。
+    """
+    candidates = [
+        {"folder_id": ROOT_ID, "cursor": "", "limit": 50},
+        {"share_id": SHARE_ID, "folder_id": ROOT_ID, "cursor": "", "limit": 50},
+        {"folder_id": ROOT_ID, "cursor": ""},
+        {"folder_id": ROOT_ID, "cursor": "", "count": 50},
+        {"knowledge_base_id": ROOT_ID, "folder_id": ROOT_ID, "cursor": "", "limit": 50},
+        {"share_id": SHARE_ID, "cursor": "", "limit": 50},
+    ]
+
+    debug_log = []
+    for body in candidates:
+        result = await api_call(page, body)
+        code  = result.get("code", -1)
+        items = result.get("knowledge_list", [])
+        entry = {
+            "body": body,
+            "code": code,
+            "items": len(items),
+            "is_end": result.get("is_end"),
+            "next_cursor": result.get("next_cursor", "")[:40],
+            "sample": items[:2] if items else [],
+        }
+        debug_log.append(entry)
+        print(f"  {json.dumps(body, ensure_ascii=False)[:75]}")
+        print(f"  => code={code}, {len(items)} 条, is_end={result.get('is_end')}, cursor={result.get('next_cursor','')[:20]}")
+
+        if code == 0 and items:
+            print("  ✅ 有效格式！")
+            DEBUG_JSON.write_text(json.dumps(debug_log, ensure_ascii=False, indent=2), encoding="utf-8")
+            # 返回去掉 folder_id / cursor 的模板（fetch_folder 会动态填入）
+            return {k: v for k, v in body.items() if k not in ("folder_id", "cursor")}
+
+        await asyncio.sleep(0.4)
+
+    DEBUG_JSON.write_text(json.dumps(debug_log, ensure_ascii=False, indent=2), encoding="utf-8")
+    return None
+
+
+async def fetch_folder(page, tmpl: dict, folder_id: str,
+                       folder_name: str, depth: int = 0) -> list:
     books, cursor, indent = [], "", "  " * depth
+    print(f"{indent}📁 {folder_name}")
     while True:
-        body = {**base_body, "folder_id": folder_id, "cursor": cursor}
-        data = await call_api(page, api_url, body)
+        body = {**tmpl, "folder_id": folder_id, "cursor": cursor}
+        data = await api_call(page, body)
 
         if data.get("code") != 0:
             print(f"{indent}  ⚠ code={data.get('code')}: {data.get('msg', data.get('error', ''))}")
@@ -73,14 +112,12 @@ async def fetch_folder(page, api_url: str, base_body: dict,
         for item in items:
             if not isinstance(item, dict):
                 continue
-            name = clean(item.get("name") or item.get("title") or "")
+            name  = clean(item.get("name") or item.get("title") or "")
             itype = item.get("type")
             if itype in (2, "folder", "dir", "directory"):
                 fid = item.get("folder_id") or item.get("id") or ""
                 if fid and name:
-                    print(f"{indent}  📁 {name}")
-                    books.extend(await fetch_folder(page, api_url, base_body,
-                                                    fid, name, depth + 1))
+                    books.extend(await fetch_folder(page, tmpl, fid, name, depth + 1))
             elif is_book_name(name):
                 books.append({"书名": name, "分类": folder_name})
 
@@ -97,33 +134,11 @@ async def main():
     if PROXY:
         browser_args.append(f"--proxy-server={PROXY}")
 
-    req_log, resp_log = [], []
-
-    async def on_request(request):
-        if "ima.qq.com" not in request.url:
-            return
-        try:
-            body = json.loads(request.post_data or "{}")
-        except Exception:
-            body = {}
-        req_log.append({"url": request.url, "body": body})
-
-    async def on_response(response):
-        if "ima.qq.com" not in response.url:
-            return
-        try:
-            if "json" not in response.headers.get("content-type", ""):
-                return
-            body = await response.json()
-            resp_log.append({"url": response.url, "body": body})
-        except Exception:
-            pass
-
     async with async_playwright() as pw:
         using_cdp = False
         try:
             browser = await pw.chromium.connect_over_cdp(CDP_URL)
-            ctx = browser.contexts[0] if browser.contexts else None
+            ctx  = browser.contexts[0] if browser.contexts else None
             page = (ctx.pages[0] if (ctx and ctx.pages)
                     else await ctx.new_page() if ctx
                     else await browser.new_page())
@@ -132,106 +147,50 @@ async def main():
         except Exception:
             print("未检测到 360浏览器，使用内置 Chromium…")
             browser = await pw.chromium.launch(headless=False, args=browser_args)
-            ctx = await browser.new_context(user_agent=(
+            ctx  = await browser.new_context(user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"))
             page = await ctx.new_page()
 
-        if not using_cdp:
-            await page.goto("https://ima.qq.com", wait_until="domcontentloaded", timeout=40000)
-            print("请登录后按 Enter")
-            input(">>> ")
-
-        # 注册拦截器
-        page.on("request", on_request)
-        page.on("response", on_response)
-
-        # 停留在 ima.qq.com，不跳转到分享链接
-        if not page.url.startswith("https://ima.qq.com"):
-            print("正在导航到 IMA 主页…")
-            await page.goto("https://ima.qq.com", wait_until="domcontentloaded", timeout=40000)
+        # 导航到分享链接，建立含 share_id 的 cookie 上下文
+        if SHARE_URL not in page.url:
+            print("\n正在打开分享链接（请确保已登录腾讯账号）…")
+            await page.goto(SHARE_URL, wait_until="domcontentloaded", timeout=40000)
+            await asyncio.sleep(4)
+        else:
             await asyncio.sleep(2)
+        print(f"当前页面：{page.url}")
 
-        # 尝试自动点击左侧「追梦人的财经图书馆」
-        print(f"\n正在查找并点击「{KB_NAME}」…")
-        clicked = False
-        for selector in [
-            f'text="{KB_NAME}"',
-            f':text("{KB_NAME}")',
-            f'[title="{KB_NAME}"]',
-            f'span:has-text("{KB_NAME}")',
-            f'div:has-text("{KB_NAME}")',
-        ]:
-            try:
-                locator = page.locator(selector).first
-                if await locator.is_visible(timeout=3000):
-                    await locator.click(timeout=3000)
-                    clicked = True
-                    print(f"  ✅ 点击成功")
-                    break
-            except Exception:
-                pass
+        # 验证 API 连通性
+        print("\n验证 API 可访问性…")
+        init = await api_call(page, {})
+        if init.get("code") != 0:
+            print(f"⚠ API 不可用，code={init.get('code')}，请确认已登录腾讯账号")
+            if not using_cdp:
+                await browser.close()
+            return
+        kb_name = (init.get("knowledge_base_info") or {}).get("basic_info", {}).get("name", "")
+        total   = init.get("total_size", "?")
+        print(f"✅ API 正常，知识库：{kb_name}，总文件数：{total}")
 
-        if not clicked:
-            print(f"  未能自动点击，请手动点击左侧「{KB_NAME}」后按 Enter")
-            input("  >>> ")
+        # 探测有效请求体格式
+        print("\n正在探测 API 请求体格式（尝试多种参数组合）…")
+        tmpl = await find_working_template(page)
 
-        print("等待 API 响应…")
-        await asyncio.sleep(6)
-
-        # 保存调试数据
-        DEBUG_REQ.write_text(json.dumps(req_log, ensure_ascii=False, indent=2), encoding="utf-8")
-        DEBUG_RESP.write_text(json.dumps(resp_log[:20], ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"拦截到 {len(req_log)} 个请求，{len(resp_log)} 个响应")
-
-        # 打印所有 knowledge 相关 API URL（排除静态文件）
-        kb_requests = [r for r in req_log if is_knowledge_api(r["url"])]
-        print(f"知识库 API 请求：{len(kb_requests)} 个")
-        for r in kb_requests:
-            print(f"  {r['url']}  参数：{r['body']}")
-
-        # 从请求里找正确的 API
-        api_url, base_body, root_id = None, {}, ""
-        for r in kb_requests:
-            body = r["body"]
-            # 找包含 folder_id 或 knowledge_base_id 的请求
-            if "folder_id" in body or "knowledge_base_id" in body:
-                api_url = r["url"]
-                base_body = {k: v for k, v in body.items()
-                             if k not in ("folder_id", "cursor")}
-                root_id = body.get("folder_id") or body.get("knowledge_base_id") or ""
-                print(f"\n✅ 找到 API：{api_url}")
-                print(f"   参数模板：{base_body}")
-                print(f"   根 ID：{root_id}")
-                break
-
-        # 从响应里补充根 ID
-        if not root_id:
-            for r in resp_log:
-                b = r["body"]
-                if not isinstance(b, dict) or b.get("code") != 0:
-                    continue
-                path = b.get("current_path", [])
-                if path and isinstance(path, list):
-                    root_id = path[-1].get("folder_id", "")
-                    if root_id:
-                        break
-
-        if not api_url or not root_id:
-            print("\n⚠ 未捕获到知识库 API。")
-            print(f"请把 {DEBUG_REQ.name} 和 {DEBUG_RESP.name} 发给我分析。")
+        if tmpl is None:
+            print(f"\n⚠ 所有格式均未返回数据，请把 {DEBUG_JSON.name} 发给我分析。")
             if not using_cdp:
                 await browser.close()
             return
 
-        print("\n开始全自动提取书单…\n")
-        books = await fetch_folder(page, api_url, base_body, root_id, KB_NAME, 0)
+        print(f"\n开始递归提取书单（参数模板：{tmpl}）…\n")
+        books = await fetch_folder(page, tmpl, ROOT_ID, KB_NAME, 0)
 
         if not using_cdp:
             await browser.close()
 
     if not books:
-        print(f"\n⚠  未能提取到书目，请把 {DEBUG_REQ.name} 和 {DEBUG_RESP.name} 发给我。")
+        print(f"\n⚠ 未能提取到书目，请把 {DEBUG_JSON.name} 发给我。")
         return
 
     books.sort(key=lambda b: (b["分类"], b["书名"]))
