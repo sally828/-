@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-腾讯 IMA 知识库书单提取脚本 v9
-策略：
-  1. 全自动点击 22 个顶层文件夹（Playwright 自动操作，无需手动）
-  2. 从拦截到的浏览器真实请求中发现 API 参数模板
-  3. 优先用 page.evaluate() 执行 fetch()（走浏览器自己的网络栈）
-     → BFS 自动遍历所有子文件夹
-  4. 若 fetch 失败(code≠0)，回退到全自动点击导航
-     → BFS 路径点击，同样遍历到最末级
+腾讯 IMA 知识库书单提取脚本 v10
+核心修复：
+  - goto("https://ima.qq.com/wikis") 只回到wikis首页，不是KB内部
+    → 用 ensure_in_kb_root() 每次都重新点击进入KB
+  - 顶层列表用轮询等待（最多30秒），不依赖固定sleep
+  - 全程无需手动点击
 """
 
 import asyncio
@@ -27,8 +25,8 @@ PROXY        = "http://127.0.0.1:10808"
 CDP_URL      = "http://localhost:9222"
 OUTPUT_CSV   = Path(__file__).parent / "ima_booklist.csv"
 DEBUG_JSON   = Path(__file__).parent / "ima_debug.json"
-CLICK_DELAY  = 2.5   # 秒，每次点击后等待 API 响应
-NAV_DELAY    = 2.0   # 秒，goto 后等待页面渲染
+CLICK_DELAY  = 2.5   # 每次点击后等待 API 响应（秒）
+NAV_DELAY    = 2.0   # goto 后等待页面渲染（秒）
 # ─────────────────────────────────────────────────────────────────────────────
 
 
@@ -116,6 +114,26 @@ def get_top_category(folder_id: str, id_to_name: dict, id_to_parent: dict) -> st
     return id_to_name.get(cur or folder_id, "未知分类")
 
 
+def extract_kl(body: dict) -> list:
+    """从响应body里提取knowledge_list，兼容多种结构。"""
+    if not isinstance(body, dict):
+        return []
+    code = body.get("code", -1)
+    if str(code) not in ("0", 0):
+        return []
+    # 常见结构
+    for key in ["knowledge_list", "knowledgeList", "list", "data"]:
+        val = body.get(key)
+        if isinstance(val, list) and val:
+            return val
+        if isinstance(val, dict):
+            for k2 in ["knowledge_list", "knowledgeList", "list"]:
+                v2 = val.get(k2)
+                if isinstance(v2, list) and v2:
+                    return v2
+    return []
+
+
 def absorb_items(kl: list, id_to_name: dict, id_to_parent: dict,
                  seen_books: set) -> tuple[list, list]:
     books: list       = []
@@ -140,7 +158,6 @@ def absorb_items(kl: list, id_to_name: dict, id_to_parent: dict,
 
 
 def req_body_has_id(req_body: dict, folder_id: str) -> bool:
-    """检查请求体里是否含有该文件夹 ID（任意字段值匹配）。"""
     return any(str(v) == folder_id for v in req_body.values() if v)
 
 
@@ -151,8 +168,7 @@ def discover_template(api_responses: list) -> tuple[dict | None, dict]:
     for r in reversed(api_responses):
         if "get_knowledge_list" not in r["url"]:
             continue
-        b  = r.get("body", {})
-        kl = b.get("knowledge_list", []) if isinstance(b, dict) and b.get("code") == 0 else []
+        kl = extract_kl(r.get("body", {}))
         if not kl:
             continue
         req = r.get("req_body", {})
@@ -180,10 +196,9 @@ def make_body(template: dict, folder_id: str, cursor: str = "") -> dict:
     return body
 
 
-# ── 浏览器内 fetch（走浏览器真实网络栈）─────────────────────────────────────
+# ── 浏览器内 fetch ────────────────────────────────────────────────────────────
 
 async def js_fetch(page: Page, body: dict) -> dict:
-    """在浏览器 JS 上下文里执行 fetch()，自动带上 cookies 和正确的 Sec-Fetch-* 头。"""
     try:
         result = await page.evaluate(
             """async ([url, bodyStr]) => {
@@ -209,7 +224,7 @@ async def js_fetch(page: Page, body: dict) -> dict:
         return {"code": -1, "error": str(e)}
 
 
-# ── 浏览器点击工具 ────────────────────────────────────────────────────────────
+# ── 浏览器点击 ────────────────────────────────────────────────────────────────
 
 async def try_click_name(page: Page, name: str, timeout_ms: int = 5000) -> bool:
     safe = name.replace("\\", "\\\\").replace('"', '\\"')
@@ -220,6 +235,7 @@ async def try_click_name(page: Page, name: str, timeout_ms: int = 5000) -> bool:
         f'div:has-text("{safe}")',
         f'a:has-text("{safe}")',
         f'li:has-text("{safe}")',
+        f'p:has-text("{safe}")',
     ]:
         try:
             loc = page.locator(sel).first
@@ -231,10 +247,37 @@ async def try_click_name(page: Page, name: str, timeout_ms: int = 5000) -> bool:
     return False
 
 
-async def navigate_path(page: Page, path: list[str], root_url: str) -> bool:
-    """从 root_url 出发，依次点击路径里每个文件夹名，导航到目标层级。"""
-    await page.goto(root_url, wait_until="domcontentloaded", timeout=30_000)
+async def ensure_in_kb_root(page: Page) -> bool:
+    """
+    核心导航函数：每次调用都从wikis首页重新点击进入KB根目录。
+    这是唯一可靠的"重置"方式，因为URL永远是 https://ima.qq.com/wikis。
+    """
+    await page.goto("https://ima.qq.com/wikis",
+                    wait_until="domcontentloaded", timeout=30_000)
     await asyncio.sleep(NAV_DELAY)
+
+    # 尝试展开「共享知识库」列表
+    await try_click_name(page, "共享知识库", timeout_ms=4000)
+    await asyncio.sleep(1.5)
+
+    # 点击目标KB名称
+    ok = await try_click_name(page, KB_NAME, timeout_ms=6000)
+    if not ok:
+        # 兜底：在整个页面搜索
+        print(f"  ⚠ 自动点击「{KB_NAME}」失败，请手动点击后按 Enter")
+        await async_input("  >>> ")
+    await asyncio.sleep(CLICK_DELAY)
+    return True
+
+
+async def navigate_path(page: Page, path: list[str]) -> bool:
+    """
+    进入KB根目录，再依次点击path里的每个文件夹名。
+    path = ["顶层分类名", "子文件夹名", ...]  （不含KB名本身）
+    """
+    ok = await ensure_in_kb_root(page)
+    if not ok:
+        return False
     for folder_name in path:
         found = await try_click_name(page, folder_name)
         if not found:
@@ -244,17 +287,36 @@ async def navigate_path(page: Page, path: list[str], root_url: str) -> bool:
     return True
 
 
-# ── Phase 1：全自动点击 22 个顶层文件夹 ─────────────────────────────────────
+# ── 等待顶层列表出现 ──────────────────────────────────────────────────────────
+
+async def wait_for_top_items(api_responses: list, timeout_sec: int = 30) -> list:
+    """轮询 api_responses，直到找到包含最多 knowledge_list 的响应。"""
+    best: list = []
+    for _ in range(timeout_sec * 2):
+        for r in api_responses:
+            if "get_knowledge_list" not in r["url"]:
+                continue
+            kl = extract_kl(r.get("body", {}))
+            if len(kl) > len(best):
+                best = kl
+        if best:
+            return best
+        await asyncio.sleep(0.5)
+    return best
+
+
+# ── Phase 1：全自动点击 22 个顶层文件夹 ──────────────────────────────────────
 
 async def auto_click_top_folders(
     page: Page, folder_items: list,
     id_to_name: dict, id_to_parent: dict,
-    api_responses: list, root_url: str, seen_books: set
+    api_responses: list, seen_books: set
 ) -> tuple[list, list]:
     books: list       = []
     sub_folders: list = []
     total = len(folder_items)
     print(f"\n【Phase 1】全自动点击 {total} 个顶层文件夹…")
+
     for i, item in enumerate(folder_items, 1):
         name = clean(item.get("name") or item.get("title") or "")
         fid  = extract_id(item)
@@ -263,8 +325,8 @@ async def auto_click_top_folders(
         print(f"  [{i:2d}/{total}] {name}… ", end="", flush=True)
         count_before = len(api_responses)
 
-        await page.goto(root_url, wait_until="domcontentloaded", timeout=30_000)
-        await asyncio.sleep(NAV_DELAY)
+        # 每次都重新进入KB，再点击目标文件夹
+        await ensure_in_kb_root(page)
         found = await try_click_name(page, name)
         if not found:
             print("⚠ 元素未找到")
@@ -275,26 +337,25 @@ async def auto_click_top_folders(
         for r in api_responses[count_before:]:
             if "get_knowledge_list" not in r["url"]:
                 continue
-            b  = r.get("body", {})
-            kl = b.get("knowledge_list", []) if isinstance(b, dict) and b.get("code") == 0 else []
+            kl = extract_kl(r.get("body", {}))
             if not kl:
                 continue
             nb, nf = absorb_items(kl, id_to_name, id_to_parent, seen_books)
             books.extend(nb)
             sub_folders.extend(nf)
             fb += len(nb); ff += len(nf)
-        print(f"✓ {fb} 本书  {ff} 子文件夹")
+        print(f"✓ {fb}本书  {ff}子文件夹")
+
     return books, sub_folders
 
 
-# ── Phase 2A：BFS + 浏览器 JS fetch ─────────────────────────────────────────
+# ── Phase 2A：BFS + JS fetch ──────────────────────────────────────────────────
 
 async def bfs_js_fetch(
     page: Page, root_folders: list,
     id_to_name: dict, id_to_parent: dict,
     seen_books: set, template: dict
 ) -> tuple[list, bool]:
-    """返回 (books, success)。连续 5 次 code≠0 则放弃，返回 success=False。"""
     books: list     = []
     visited: set    = set()
     queue: deque    = deque(root_folders)
@@ -320,9 +381,9 @@ async def bfs_js_fetch(
             body = make_body(template, fid, cursor)
             data = await js_fetch(page, body)
             code = data.get("code", -1)
-            kl   = data.get("knowledge_list", [])
+            kl   = extract_kl(data)
 
-            if code != 0:
+            if code != 0 or not kl:
                 fail_streak += 1
                 if done <= 5 or done % 50 == 0:
                     print(f"  [{done}/{total}] ⚠ {fname}: code={code}")
@@ -341,36 +402,34 @@ async def bfs_js_fetch(
                     total += 1
 
             if done <= 5 or done % 100 == 0:
-                print(f"  [{done}/{total}] ✓ {fname}: {len(nb)} 本书  {len(nf)} 子文件夹")
+                print(f"  [{done}/{total}] ✓ {fname}: {len(nb)}本书  {len(nf)}子文件夹")
 
             next_cur = data.get("next_cursor", "")
-            if data.get("is_end", True) or not kl or not next_cur or next_cur == cursor:
+            if data.get("is_end", True) or not next_cur or next_cur == cursor:
                 break
             cursor = next_cur
             await asyncio.sleep(0.2)
 
         await asyncio.sleep(0.1)
 
-    print(f"\n  JS fetch BFS 完成：{done} 个文件夹，累计 {len(books)} 本书")
+    print(f"\n  JS fetch BFS 完成：{done}个文件夹，{len(books)}本书")
     return books, True
 
 
-# ── Phase 2B：BFS + 全自动点击导航（兜底，必定有效）─────────────────────────
+# ── Phase 2B：BFS + 全自动点击导航（保底） ───────────────────────────────────
 
 async def bfs_auto_click(
     page: Page, root_folders: list,
     id_to_name: dict, id_to_parent: dict,
-    seen_books: set, api_responses: list, root_url: str
+    seen_books: set, api_responses: list
 ) -> list:
     """
-    从 root_url 出发，按路径点击到每个文件夹，拦截浏览器真实 API 响应。
-    队列元素格式：(item, path_list)
-    path_list 是从顶层到当前文件夹的名称列表。
+    对每个子文件夹：ensure_in_kb_root() → 按路径依次点击各层文件夹名。
+    保底方案，必然有效，任意嵌套深度。
     """
     books: list  = []
     visited: set = set()
 
-    # 构建初始队列：把每个 root_folder 的路径追溯到顶层
     queue: deque = deque()
     for item in root_folders:
         fid   = extract_id(item)
@@ -383,7 +442,7 @@ async def bfs_auto_click(
     total = len(queue)
     done  = 0
     print(f"\n【Phase 2B】自动点击 BFS，队列 {total} 个文件夹")
-    print("  （每个文件夹约 5-8 秒，全部完成后自动输出 CSV）\n")
+    print("  （每个文件夹约 8-12 秒，脚本全程自动运行，请勿操作浏览器）\n")
 
     while queue:
         item, path = queue.popleft()
@@ -393,14 +452,13 @@ async def bfs_auto_click(
         visited.add(fid)
         done += 1
 
-        if done % 20 == 0 or done <= 5:
+        if done <= 5 or done % 20 == 0:
             print(f"  [{done}/{total}] 导航: {' ▶ '.join(path)}")
 
         count_before = len(api_responses)
-        ok = await navigate_path(page, path, root_url)
+        ok = await navigate_path(page, path)
         if not ok:
             continue
-        # 等待 API 响应稳定
         await asyncio.sleep(1.0)
 
         nb_total, nf_total = 0, 0
@@ -408,11 +466,9 @@ async def bfs_auto_click(
             if "get_knowledge_list" not in r["url"]:
                 continue
             req_b = r.get("req_body", {})
-            # 只处理目标文件夹的响应（req_body 里含有该 folder_id）
             if not req_body_has_id(req_b, fid):
                 continue
-            b  = r.get("body", {})
-            kl = b.get("knowledge_list", []) if isinstance(b, dict) and b.get("code") == 0 else []
+            kl = extract_kl(r.get("body", {}))
             if not kl:
                 continue
             nb, nf = absorb_items(kl, id_to_name, id_to_parent, seen_books)
@@ -426,10 +482,10 @@ async def bfs_auto_click(
                     total += 1
             nf_total += len(nf)
 
-        if done % 20 == 0 or done <= 5:
-            print(f"    → {nb_total} 本书  {nf_total} 新子文件夹")
+        if done <= 5 or done % 20 == 0:
+            print(f"    → {nb_total}本书  {nf_total}新子文件夹")
 
-    print(f"\n  自动点击 BFS 完成：{done} 个文件夹，累计 {len(books)} 本书")
+    print(f"\n  自动点击 BFS 完成：{done}个文件夹，{len(books)}本书")
     return books
 
 
@@ -442,7 +498,6 @@ async def main():
         using_cdp = False
         ctx: BrowserContext | None = None
 
-        # 连接 360 浏览器
         try:
             browser  = await pw.chromium.connect_over_cdp(CDP_URL)
             ctx      = browser.contexts[0] if browser.contexts else None
@@ -464,7 +519,7 @@ async def main():
             ctx      = await browser.new_context()
             page     = await ctx.new_page()
 
-        # 注册拦截器
+        # 注册拦截器（所有已有标签页 + 新标签页）
         if ctx:
             for p in ctx.pages:
                 register_on_page(p, api_responses)
@@ -473,59 +528,42 @@ async def main():
             register_on_page(page, api_responses)
 
         if not using_cdp:
-            await page.goto("https://ima.qq.com", wait_until="domcontentloaded", timeout=40_000)
+            await page.goto("https://ima.qq.com",
+                            wait_until="domcontentloaded", timeout=40_000)
             print("请登录后按 Enter")
             await async_input(">>> ")
 
-        # ── 导航进入知识库 ────────────────────────────────────────────────────
-        print("\n导航到 IMA 主页…")
-        await page.goto("https://ima.qq.com", wait_until="domcontentloaded", timeout=40_000)
-        await asyncio.sleep(3)
+        # ── 首次进入KB，获取顶层列表 ─────────────────────────────────────────
+        print(f"\n正在导航进入「{KB_NAME}」…")
+        await ensure_in_kb_root(page)
 
-        print("点击「个人知识库」…")
-        await try_click_name(page, "个人知识库")
-        await asyncio.sleep(3)
-
-        print("点击「共享知识库」…")
-        await try_click_name(page, "共享知识库")
-        await asyncio.sleep(2)
-
-        print(f"点击「{KB_NAME}」…")
-        ok = await try_click_name(page, KB_NAME, timeout_ms=6000)
-        if not ok:
-            print(f"  ⚠ 自动点击失败，请手动点击「{KB_NAME}」后按 Enter")
-            await async_input("  >>> ")
-
-        print("等待知识库页面加载（10 秒）…")
-        await asyncio.sleep(10)
-
-        # 找到 wikis 标签页
-        all_pages = ctx.pages if ctx else [page]
-        kb_page   = page
-        for p in all_pages:
-            if "wikis" in p.url or "wiki" in p.url:
-                kb_page = p
-                break
-        root_url = kb_page.url
-        print(f"标签页 URL：{root_url}")
-        print(f"已拦截 {len(api_responses)} 个 API 响应")
-
-        # ── 获取 22 个顶层分类 ────────────────────────────────────────────────
-        top_items: list = []
-        for r in api_responses:
-            if "get_knowledge_list" not in r["url"]:
-                continue
-            b  = r.get("body", {})
-            kl = b.get("knowledge_list", []) if isinstance(b, dict) and b.get("code") == 0 else []
-            if len(kl) > len(top_items):
-                top_items = kl
+        # 等待顶层列表出现（最多 30 秒）
+        print("等待顶层列表 API 响应（最多 30 秒）…")
+        top_items = await wait_for_top_items(api_responses, timeout_sec=30)
 
         if not top_items:
-            print("⚠ 未找到顶层列表，请检查是否已进入知识库页面。")
+            print(f"\n⚠ 30秒内未捕获到顶层列表。")
+            print(f"  已拦截 {len(api_responses)} 个响应，保存调试文件…")
+            DEBUG_JSON.write_text(
+                json.dumps(api_responses, ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
+            print(f"  请把 {DEBUG_JSON} 发给我分析。")
             if not using_cdp:
                 await browser.close()
             return
 
+        # 用于查找 kb_page（带 wikis 的标签页）
+        all_pages = ctx.pages if ctx else [page]
+        kb_page   = page
+        for p in all_pages:
+            if "wikis" in p.url:
+                kb_page = p
+                break
+        print(f"✅ 标签页 URL：{kb_page.url}")
+        print(f"   已拦截 {len(api_responses)} 个 API 响应")
+
+        # ── 解析顶层结构 ──────────────────────────────────────────────────────
         id_to_name:   dict[str, str] = {}
         id_to_parent: dict[str, str] = {}
         for it in top_items:
@@ -543,7 +581,6 @@ async def main():
         seen_books: set = set()
         books: list     = []
 
-        # 顶层直接文档
         for it in doc_items:
             nm = clean(it.get("name") or it.get("title") or "")
             if is_book_name(nm) and nm not in seen_books:
@@ -553,10 +590,10 @@ async def main():
         # ── Phase 1：全自动点击 22 个顶层文件夹 ─────────────────────────────
         p1_books, p1_folders = await auto_click_top_folders(
             kb_page, folder_items, id_to_name, id_to_parent,
-            api_responses, root_url, seen_books
+            api_responses, seen_books
         )
         books.extend(p1_books)
-        print(f"\nPhase 1 完成：{len(p1_books)} 本书  {len(p1_folders)} 个子文件夹")
+        print(f"\nPhase 1 完成：{len(p1_books)}本书  {len(p1_folders)}个子文件夹")
 
         # ── Phase 2：处理所有子文件夹 ────────────────────────────────────────
         if p1_folders:
@@ -565,39 +602,38 @@ async def main():
             if template:
                 print(f"\n✅ 发现 API 参数模板：{template}")
                 js_books, js_ok = await bfs_js_fetch(
-                    kb_page, p1_folders, id_to_name, id_to_parent, seen_books, template
+                    kb_page, p1_folders, id_to_name, id_to_parent,
+                    seen_books, template
                 )
                 books.extend(js_books)
 
                 if not js_ok:
-                    # JS fetch 失败，回退到全自动点击
                     click_books = await bfs_auto_click(
                         kb_page, p1_folders, id_to_name, id_to_parent,
-                        seen_books, api_responses, root_url
+                        seen_books, api_responses
                     )
                     books.extend(click_books)
             else:
-                # 未找到模板，直接走自动点击
                 print("\n⚠ 未找到 API 参数模板，直接使用自动点击模式")
                 click_books = await bfs_auto_click(
                     kb_page, p1_folders, id_to_name, id_to_parent,
-                    seen_books, api_responses, root_url
+                    seen_books, api_responses
                 )
                 books.extend(click_books)
 
-        # 保存调试数据（最后 100 条响应）
+        # 保存调试数据
         DEBUG_JSON.write_text(
             json.dumps(api_responses[-100:], ensure_ascii=False, indent=2),
             encoding="utf-8"
         )
-        print(f"\n调试数据已保存至 {DEBUG_JSON.name}（最后 100 条）")
+        print(f"\n调试数据已保存至 {DEBUG_JSON.name}（最后100条）")
 
         if not using_cdp:
             await browser.close()
 
     # ── 写 CSV ────────────────────────────────────────────────────────────────
     if not books:
-        print("\n⚠ 未提取到任何书目，请把 ima_debug.json 发给我分析。")
+        print("\n⚠ 未提取到任何书目。")
         return
 
     books.sort(key=lambda b: (b["分类"], b["书名"]))
